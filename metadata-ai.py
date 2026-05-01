@@ -91,6 +91,110 @@ def process_archive(folder):
         current_file = files[i]
         if current_file in processed_files:
             continue
+
+        current_path = os.path.join(folder, current_file)
+        found_date = None
+
+        print(f"\n[{i+1}/{len(files)}] Processing: {current_file}")
+
+        # Step 1: Check if the NEXT photo is the back
+        back_confirmed = False
+        print(f"   1) Checking if next image is back-of-photo...")
+        if i + 1 < len(files):
+            next_file = files[i+1]
+            next_path = os.path.join(folder, next_file)
+
+            is_back_prompt = (
+                "Look very carefully at this image. Is it the BACK (reverse side) of a physical printed photograph? "
+                "The back would show: blank paper, handwriting, stamps, photo lab printing, or a plain surface. "
+                "If you see any photographic image content AT ALL, answer No. "
+                "Answer ONLY 'Yes' or 'No'."
+            )
+            is_back_resp = ask_vlm(next_path, is_back_prompt)
+
+            is_back = False
+            if is_back_resp.strip().lower().startswith("yes"):
+                confirm_prompt = "Does this image show a photographic scene with people, places, or objects? Answer ONLY 'Yes' or 'No'."
+                confirm_resp = ask_vlm(next_path, confirm_prompt)
+                if not confirm_resp.strip().lower().startswith("yes"):
+                    is_back = True
+
+            if is_back:
+                back_confirmed = True
+                print(f"      Back confirmed: {next_file}")
+                processed_files.add(next_file)
+
+                ocr_prompt = "Extract any date written on this photo back. Return ONLY in YYYY:MM:DD format. If no date is present, return 'none'."
+                resp = ask_vlm(next_path, ocr_prompt)
+                date_match = re.search(r'(\d{4})[:/-](\d{2})[:/-](\d{2})', resp)
+                if date_match:
+                    found_date = f"{date_match.group(1)}:{date_match.group(2)}:{date_match.group(3)} 12:00:00"
+                    print(f"      Date from back: {found_date}")
+                else:
+                    print(f"      No date on back — falling through to VLM guess.")
+            else:
+                print(f"      No back detected.")
+        else:
+            print(f"      No next image to check.")
+
+        # Step 2: Check existing EXIF tags
+        if not found_date:
+            print(f"   2) Checking existing EXIF tags...")
+            try:
+                exif_data = piexif.load(current_path)
+                comment_bytes = exif_data['Exif'].get(piexif.ExifIFD.UserComment, b'')
+                comment = piexif.helper.UserComment.load(comment_bytes) if comment_bytes else ""
+                date_match = re.search(r'(\d{4})[:/-](\d{2})', str(comment))
+                if date_match:
+                    found_date = f"{date_match.group(1)}:{date_match.group(2)}:01 12:00:00"
+                    print(f"      Date from EXIF: {found_date}")
+                else:
+                    print(f"      No date in EXIF.")
+            except:
+                print(f"      Could not read EXIF.")
+
+        # Step 3: LLM Visual Guessing
+        if not found_date:
+            print(f"   3) Asking VLM to guess date from image content...")
+            guess_prompt = "Analyze fashion and technology in this photo. Estimate year and month. Return ONLY YYYY:MM. Must be before 2010."
+            resp = ask_vlm(current_path, guess_prompt)
+            date_match = re.search(r'(\d{4})[:/-](\d{2})', resp)
+            if date_match:
+                found_date = f"{date_match.group(1)}:{date_match.group(2)}:01 12:00:00"
+                print(f"      VLM guessed date: {found_date}")
+            else:
+                print(f"      VLM could not determine a date.")
+
+        # Step 4: Write metadata
+        print(f"   4) 💾 Writing metadata...")
+        if found_date:
+            try:
+                year = int(found_date[:4])
+                if year < 2010:
+                    tags_resp = ask_vlm(current_path, "Describe this photo in 5 keywords, comma separated.")
+                    apply_metadata(current_path, found_date, tags_resp)
+                else:
+                    print(f"      ⏭️  Skipping: date {year} is too recent.")
+            except: pass
+        else:
+            print(f"      ❌ No date found — skipping.")
+
+if __name__ == "__main__":
+    process_archive(DIRECTORY)
+def process_archive(folder):
+    if not os.path.exists(folder):
+        print(f"Directory {folder} not found.")
+        return
+
+    files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(('.jpg', '.jpeg', '.tiff', '.tif'))])
+    processed_files = set()
+    
+    print(f"Starting archival of {len(files)} photos...")
+
+    for i in range(len(files)):
+        current_file = files[i]
+        if current_file in processed_files:
+            continue
             
         current_path = os.path.join(folder, current_file)
         found_date = None
