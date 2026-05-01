@@ -43,7 +43,7 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 
 ## Configuration
 
-At the top of `archivai.py`, set the following:
+At the top of `metadata-ai.py`, set the following:
 
 ```python
 DIRECTORY = "./photos"   # Path to your folder of scanned images
@@ -57,7 +57,7 @@ MODEL_ID = "qwen/qwen3.6-27b"  # Must match the model identifier in LM Studio
 Place your scanned photos in the `./photos` folder (or update `DIRECTORY`), then run:
 
 ```bash
-python archivai.py
+python metadata-ai.py
 ```
 
 If you scanned the backs of photos, place them immediately after the front in filename order (e.g. `img001.jpg` front, `img002.jpg` back). The script will detect and pair them automatically.
