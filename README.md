@@ -28,7 +28,7 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/bcholodenko/metadata-ai.git
+   git clone https://github.com/bcholodenko/Metadata-AI.git
    cd metadata-ai
    ```
 
