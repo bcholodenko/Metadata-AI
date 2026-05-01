@@ -2,3 +2,4 @@ natsort
 openai
 piexif
 Pillow
+pillow-heif
