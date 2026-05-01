@@ -18,10 +18,20 @@ def get_base64_image(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
+def get_jpeg_base64(image_path):
+    """Converts any supported image to JPEG in memory and returns base64. LM Studio only supports JPEG, PNG, WebP."""
+    import io
+    img = Image.open(image_path)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=90)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
 def ask_vlm(image_path, prompt):
-    """Sends an image to LM Studio for analysis. Accesses response correctly via list index."""
+    """Sends an image to LM Studio as JPEG regardless of source format."""
     try:
-        base64_image = get_base64_image(image_path)
+        base64_image = get_jpeg_base64(image_path)
         response = CLIENT.chat.completions.create(
             model=MODEL_ID,
             messages=[{
@@ -32,7 +42,6 @@ def ask_vlm(image_path, prompt):
                 ]
             }]
         )
-        # FIX 1: Access choices via index [0]
         return response.choices[0].message.content
     except Exception as e:
         print(f"   API Error: {e}")
@@ -41,7 +50,10 @@ def ask_vlm(image_path, prompt):
 def apply_metadata(path, date_str, tags=None):
     """Applies Date Taken and Tags to EXIF. Uses piexif for JPEG, Pillow for TIFF."""
     ext = os.path.splitext(path)[1].lower()
-    if ext in ('.tiff', '.tif', '.png', '.heic'):
+    if ext in ('.tiff', '.tif', '.png', '.heic', '.webp'):
+        _apply_metadata_tiff(path, date_str, tags)
+    elif ext == '.dng':
+        _apply_metadata_dng(path, date_str, tags)
         _apply_metadata_tiff(path, date_str, tags)
     else:
         _apply_metadata_jpeg(path, date_str, tags)
@@ -78,12 +90,44 @@ def _apply_metadata_tiff(path, date_str, tags=None):
     except Exception as e:
         print(f"   Metadata Error for {os.path.basename(path)}: {e}")
 
-def process_archive(folder):
+def _apply_metadata_dng(path, date_str, tags=None, comment=None):
+    """Writes metadata for DNG files via XMP sidecar."""
+    try:
+        xmp_path = os.path.splitext(path)[0] + ".xmp"
+        keywords_xml = ""
+        if tags:
+            keywords_xml = "".join(
+                f"      <rdf:li>{kw.strip()}</rdf:li>\n" for kw in tags.split(",")
+            )
+        comment_xml = f"  <dc:description><rdf:Alt><rdf:li xml:lang='x-default'>{comment}</rdf:li></rdf:Alt></dc:description>\n" if comment else ""
+        xmp_content = f"""<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description xmlns:xmp='http://ns.adobe.com/xap/1.0/'
+                     xmlns:dc='http://purl.org/dc/elements/1.1/'
+                     xmlns:exif='http://ns.adobe.com/exif/1.0/'>
+      <exif:DateTimeOriginal>{date_str}</exif:DateTimeOriginal>
+{comment_xml}      <dc:subject>
+        <rdf:Bag>
+{keywords_xml}        </rdf:Bag>
+      </dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>"""
+        with open(xmp_path, "w", encoding="utf-8") as f:
+            f.write(xmp_content)
+        print(f"   💾 Success: {os.path.basename(xmp_path)} written.")
+    except Exception as e:
+        print(f"   Metadata Error for {os.path.basename(path)}: {e}")
+
+
+def process_archive(folder, cutoff_year=2010):
     if not os.path.exists(folder):
         print(f"Directory {folder} not found.")
         return
 
-    files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(('.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic'))])
+    files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(('.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.dng', '.webp'))])
     processed_files = set()
     
     print(f"Starting archival of {len(files)} photos...")
@@ -186,15 +230,28 @@ def process_archive(folder):
         if found_date:
             try:
                 year = int(found_date[:4])
-                if year < 2010:
+                if year < cutoff_year:
                     tags_resp = ask_vlm(current_path, "Describe this photo in 5 keywords, comma separated.")
                     combined_tags = f"{tags_resp} | {found_comment}" if found_comment else tags_resp
                     apply_metadata(current_path, found_date, combined_tags)
                 else:
-                    print(f"      ⏭️  Skipping: date {year} is too recent.")
+                    print(f"      ⏭️  Skipping: date {year} is {cutoff_year} or later.")
             except: pass
         else:
             print(f"      ❌ No date found — skipping.")
 
 if __name__ == "__main__":
-    process_archive(DIRECTORY)
+    import sys
+    if len(sys.argv) > 1:
+        directory = sys.argv[1]
+    else:
+        directory = input(f"Enter photos directory [{DIRECTORY}]: ").strip().replace(chr(92) + " ", " ") or DIRECTORY
+
+    cutoff_input = input("Skip photos dated from which year or later? [2010]: ").strip()
+    try:
+        cutoff_year = int(cutoff_input) if cutoff_input else 2010
+    except ValueError:
+        print("Invalid year, defaulting to 2010.")
+        cutoff_year = 2010
+
+    process_archive(directory, cutoff_year)
