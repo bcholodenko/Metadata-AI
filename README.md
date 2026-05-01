@@ -1,19 +1,25 @@
-# Metadata AI
+# Metadata-AI
 
-Metadata AI is a local AI-powered tool that automatically tags and dates scanned physical photographs by writing metadata directly into JPEG and TIFF EXIF data.
+<img width="600" alt="logo" src="https://github.com/user-attachments/assets/0136052d-84d7-48e3-8967-a2b09c5c38e2" />
 
-It uses a vision language model (VLM) running locally via [LM Studio](https://lmstudio.ai) to analyze each photo, detect whether the next scanned image is the back of a photograph, extract handwritten dates via OCR, and estimate dates from visual cues like fashion and technology when no written date is available.
+Metadata-AI is a local AI-powered tool that automatically tags and dates scanned physical photographs by writing metadata directly into image files.
+
+It uses a vision language model (VLM) running locally via [LM Studio](https://lmstudio.ai) to analyze each photo, detect whether the next scanned image is the back of a photograph, extract handwritten dates and comments via OCR (translating to English if needed), and estimate dates from visual cues like fashion and technology when no written date is available.
 
 ---
 
 ## Features
 
 - Detects back-of-photo scans and extracts handwritten dates via OCR
+- Extracts and saves handwritten comments from the back of photos, translating to English if needed
 - Falls back to AI visual date estimation based on fashion and technology in the image
-- Writes `DateTimeOriginal`, comments from the back of the photo, and keyword tags into EXIF metadata
-- Supports `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.png`, and `.heic` files
-- Skips photos dated 2010 or later. This can be customized in the script.
+- Writes `DateTimeOriginal` and keyword tags into EXIF metadata
+- Supports `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.png`, `.heic`, `.webp`, and `.dng` files
+- DNG files are written as `.xmp` sidecar files, compatible with Lightroom and Apple Photos
+- All images are converted to JPEG in memory before being sent to LM Studio for analysis (LM Studio supports JPEG, PNG, and WebP only)
+- Skips photos dated at or after a configurable cutoff year (default: 2010)
 - Runs entirely locally — no cloud API required
+- Prompts for photos directory at runtime, or accepts it as a command line argument
 
 ---
 
@@ -29,7 +35,7 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 1. Clone this repository:
    ```bash
    git clone https://github.com/bcholodenko/Metadata-AI.git
-   cd metadata-ai
+   cd Metadata-AI
    ```
 
 2. Install dependencies:
@@ -48,18 +54,32 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 At the top of `metadata-ai.py`, set the following:
 
 ```python
-DIRECTORY = "./photos"   # Path to your folder of scanned images
-MODEL_ID = "qwen/qwen3.6-27b"  # Must match the model identifier in LM Studio
+DIRECTORY = "./photos"         # Default fallback if no directory is provided at runtime
+MODEL_ID = "qwen/qwen3.6-27b" # Must match the model identifier in LM Studio
 ```
+
+The cutoff year is set interactively at runtime — you will be prompted each time you run the script.
 
 ---
 
 ## Usage
 
-Place your scanned photos in the `./photos` folder (or update `DIRECTORY`), then run:
+Run the script — you will be prompted for the photos directory and the cutoff year:
 
 ```bash
 python metadata-ai.py
+```
+
+Example prompts:
+```
+Enter photos directory [./photos]: /Users/username/johnappleseed/Pictures/Scans
+Skip photos dated from which year or later? [2010]: 1995
+```
+
+Or pass the directory as a command line argument:
+
+```bash
+python metadata-ai.py /path/to/photos
 ```
 
 If you scanned the backs of photos, place them immediately after the front in filename order (e.g. `img001.jpg` front, `img002.jpg` back). The script will detect and pair them automatically.
@@ -68,10 +88,23 @@ If you scanned the backs of photos, place them immediately after the front in fi
 
 ## How It Works
 
-1. **Back detection** — For each photo, the script checks if the next image is the reverse side of a physical print. If confirmed, it attempts to OCR a date from the back. If no date is found, the photo is skipped.
+1. **Back detection** — For each photo, the script checks if the next image is the reverse side of a physical print using a two-step VLM confirmation. If confirmed, it attempts to OCR a date and any handwritten comments from the back. Comments are translated to English if needed. If no date is found on the back, the script falls through to step 3.
 2. **Existing EXIF check** — If no back is found, it checks for an existing date in the photo's EXIF UserComment field.
 3. **AI visual estimation** — If still no date, the VLM analyzes fashion, technology, and other visual cues to estimate the year and month.
-4. **Metadata writing** — Valid dates are written into the file's EXIF data along with AI-generated keyword tags.
+4. **Metadata writing** — Valid dates before the cutoff year are written into the file along with AI-generated keyword tags and any comments extracted from the back. DNG files receive a `.xmp` sidecar instead of direct EXIF modification.
+
+---
+
+## Supported Formats
+
+| Format | Metadata method |
+|---|---|
+| `.jpg`, `.jpeg` | piexif (EXIF) |
+| `.tiff`, `.tif` | Pillow (TIFF tags) |
+| `.png` | Pillow (TIFF tags) |
+| `.heic` | Pillow via pillow-heif |
+| `.webp` | Pillow |
+| `.dng` | XMP sidecar file |
 
 ---
 
