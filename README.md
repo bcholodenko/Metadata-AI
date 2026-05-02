@@ -48,20 +48,6 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 
 ---
 
-## Configuration
-
-At the top of `metadata-ai.py`, set the following:
-
-```python
-DIRECTORY = "./photos"         # Default fallback if no directory is provided at runtime
-MODEL_ID = "qwen/qwen3.6-27b" # Must match the model identifier in LM Studio
-VLM_MAX_DIMENSION = 2048       # Long-edge pixel cap before sending to VLM
-```
-
-The cutoff year and other options are set interactively at runtime.
-
----
-
 ## Usage
 
 Run the script — you will be prompted for the photos directory and processing options:
