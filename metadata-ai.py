@@ -138,9 +138,31 @@ def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=N
         _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
     elif ext in ('.jpg', '.jpeg'):
         _apply_metadata_iptc_jpeg(path, date_str, tags, comment, gps)
+    elif ext in ('.tiff', '.tif', '.png', '.heic', '.webp'):
+        _apply_metadata_pillow(path, date_str, tags, comment)
     else:
-        print(f"   ⚠️ Metadata writing not fully implemented for {ext} using IPTC.")
+        print(f"   ⚠️ Unsupported format for metadata writing: {ext}")
 
+
+def _apply_metadata_pillow(path, date_str, tags=None, comment=None):
+    # Writes date, keywords, and caption for PNG/TIFF/HEIC/WebP via Pillow.
+    # Pillow exposes TIFF tags for all these formats; tag 306=DateTime,
+    # 270=ImageDescription, 40094=XPKeywords (UTF-16-LE, Windows convention).
+    try:
+        img = Image.open(path)
+        tag_data = {306: date_str}
+        if comment:
+            tag_data[270] = comment
+        if tags:
+            tag_data[40094] = tags.encode('utf-16-le')
+        save_kwargs = {'tiffinfo': tag_data}
+        existing_exif = img.info.get('exif')
+        if existing_exif:
+            save_kwargs['exif'] = existing_exif
+        img.save(path, **save_kwargs)
+        print(f"   💾 Success: {os.path.basename(path)} updated.")
+    except Exception as e:
+        print(f"   💾 Metadata Error ({os.path.basename(path)}): {e}")
 def _apply_metadata_iptc_jpeg(path, date_str, tags=None, comment=None, gps=None):
     """Writes Date/GPS to EXIF and Keywords/Description to IPTC."""
     try:
