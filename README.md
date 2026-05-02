@@ -89,11 +89,11 @@ If you scanned the backs of photos, place them immediately after the front in fi
 
 | Format | Metadata method |
 |---|---|
-| `.jpg`, `.jpeg` | piexif (EXIF) + iptcinfo3 (IPTC) |
-| `.tiff`, `.tif` | Pillow (TIFF tags) |
-| `.png` | Pillow (TIFF tags) |
-| `.heic` | Pillow via pillow-heif |
-| `.webp` | Pillow |
+| `.jpg`, `.jpeg` | (EXIF) + (IPTC) |
+| `.tiff`, `.tif` | (EXIF) + (IPTC) |
+| `.png` | (EXIF) + (IPTC) |
+| `.heic` | (EXIF) + (IPTC) |
+| `.webp` | (EXIF) + (IPTC) |
 | `.dng` | XMP sidecar file |
 
 ---
