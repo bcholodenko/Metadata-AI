@@ -398,20 +398,28 @@ def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=F
         if enable_geo:
             print(f"   3b) Checking for location clues...")
             geo_prompt = (
-                "Look at this photo for any location clues — landmarks, signs, place names, flags, or distinctive geography. "
-                "Also consider any text context provided. "
-                "If you can identify a specific city, region, or landmark, return it as a place name. "
-                "Otherwise return 'none'."
+                "Look at this photo for specific location clues — identifiable landmarks, street signs, place names, flags, or very distinctive geography. "
+                "If you can name a specific city, region, or landmark with confidence, return ONLY that place name, nothing else. "
+                "If there are no clear location clues, return ONLY the word 'none'."
             )
-            geo_resp = ask_vlm(current_path, geo_prompt)
-            if geo_resp.strip().lower() != "none" and geo_resp.strip():
-                print(f"      Location identified: {geo_resp.strip()}")
-                gps_coords = geolocate(geo_resp.strip())
+            geo_resp = ask_vlm(current_path, geo_prompt).strip()
+            # Filter out non-answers: 'none', long explanatory sentences, or anything without a real place name
+            is_valid_location = (
+                geo_resp.lower() != "none"
+                and len(geo_resp) < 100
+                and not any(phrase in geo_resp.lower() for phrase in [
+                    "no identifiable", "no clear", "cannot identify", "unable to",
+                    "no location", "no specific", "there are no", "i cannot", "i can't"
+                ])
+            )
+            if is_valid_location:
+                print(f"      Location identified: {geo_resp}")
+                gps_coords = geolocate(geo_resp)
                 if gps_coords:
                     print(f"      GPS: {gps_coords[0]:.4f}, {gps_coords[1]:.4f}")
                 else:
                     print(f"      Could not resolve GPS — storing as text tag.")
-                    found_comment = (found_comment + f" | Location: {geo_resp.strip()}") if found_comment else f"Location: {geo_resp.strip()}"
+                    found_comment = (found_comment + f" | Location: {geo_resp}") if found_comment else f"Location: {geo_resp}"
             else:
                 print(f"      No location identified.")
 
