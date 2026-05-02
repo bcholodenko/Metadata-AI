@@ -77,6 +77,7 @@ Skip photos dated from which year or later? [2010]: 1995
 Confidence threshold (1-10) [7]: 7
 Write metadata to XMP sidecar files only? [y/N]: n
 Enable geotagging? [y/N]: n
+Recursively process subfolders? [y/N]: y
 ```
 
 Or pass the directory as a command line argument:
