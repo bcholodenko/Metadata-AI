@@ -559,7 +559,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         directory = sys.argv[1]
     else:
-        directory = input(f"Enter photos directory [{DIRECTORY}]: ").strip().replace('\\ ', ' ') or DIRECTORY
+        raw = input(f"Enter photos directory [{DIRECTORY}]: ").strip()
+        import re as _re
+        directory = _re.sub(r'\\(.)', r'\1', raw) or DIRECTORY
 
     cutoff_input = input("Skip photos dated from which year or later? [2010]: ").strip()
     try:
