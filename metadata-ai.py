@@ -176,11 +176,24 @@ def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=N
 
 def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
     try:
-        exif_dict = piexif.load(path)
+        # Step A: write IPTC keywords/caption first via iptcinfo3.
+        # Must happen before piexif so that piexif.insert() writes EXIF cleanly on top.
+        _write_iptc_keywords(path, tags, comment)
+
+        # Step B: load EXIF (after iptcinfo3 has saved), then write date + GPS.
+        # If existing EXIF is corrupt (e.g. from a previous double-write), start fresh.
+        try:
+            exif_dict = piexif.load(path)
+        except Exception:
+            exif_dict = {}
         if 'Exif' not in exif_dict:
             exif_dict['Exif'] = {}
         if '0th' not in exif_dict:
             exif_dict['0th'] = {}
+        if 'GPS' not in exif_dict:
+            exif_dict['GPS'] = {}
+        if '1st' not in exif_dict:
+            exif_dict['1st'] = {}
 
         exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = date_str.encode('utf-8')
 
@@ -205,7 +218,6 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
 
         exif_bytes = piexif.dump(exif_dict)
         piexif.insert(exif_bytes, path)
-        _write_iptc_keywords(path, tags, comment)
         print(f"   💾 Success: {os.path.basename(path)} updated.")
     except Exception as e:
         print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
@@ -213,8 +225,15 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
 def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
     try:
         ext = os.path.splitext(path)[1].lower()
-        img = Image.open(path)
-        tiff_tags = dict(img.tag_v2) if hasattr(img, 'tag_v2') else {}
+        # Suppress corrupt EXIF warnings and fall back to clean tags if needed
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            img = Image.open(path)
+        try:
+            tiff_tags = dict(img.tag_v2) if hasattr(img, 'tag_v2') else {}
+        except Exception:
+            tiff_tags = {}
         tiff_tags[306] = date_str    # DateTime
         tiff_tags[36867] = date_str  # DateTimeOriginal (EXIF)
         parts = []
@@ -239,9 +258,6 @@ def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None,
             tiff_tags[3] = b'E' if lon >= 0 else b'W'   # GPSLongitudeRef
             tiff_tags[4] = to_dms_rational(lon)          # GPSLongitude
         img.save(path, tiffinfo=tiff_tags)
-        # iptcinfo3 only supports JPEG — use it for .tif/.tiff only
-        if ext in ('.tiff', '.tif'):
-            _write_iptc_keywords(path, tags, comment)
         print(f"   💾 Success: {os.path.basename(path)} updated.")
     except Exception as e:
         print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
