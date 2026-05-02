@@ -1,6 +1,6 @@
-# Metadata AI
+# Metadata-AI
 
-Metadata AI is a local AI-powered tool that automatically tags and dates scanned physical photographs by writing metadata directly into image files.
+Metadata-AI is a local AI-powered tool that automatically tags and dates scanned physical photographs by writing metadata directly into image files.
 
 It uses a vision language model (VLM) running locally via [LM Studio](https://lmstudio.ai) to analyze each photo, detect whether the next scanned image is the back of a photograph, extract handwritten dates and comments via OCR (translating to English if needed), and estimate dates from visual cues like fashion and technology when no written date is available.
 
@@ -72,7 +72,7 @@ python metadata-ai.py
 
 Example prompts:
 ```
-Enter photos directory [./photos]: /Volumes/Pictures/Family
+Enter photos directory [./photos]: /Users/johnappleseed/Pictures/Scans
 Skip photos dated from which year or later? [2010]: 1995
 Confidence threshold (1-10) [7]: 7
 Write metadata to XMP sidecar files only? [y/N]: n
