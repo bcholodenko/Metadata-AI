@@ -168,7 +168,7 @@ def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=N
     elif ext in ('.jpg', '.jpeg'):
         _apply_metadata_jpeg(path, date_str, tags, comment, raw_date, gps)
     elif ext in ('.tiff', '.tif', '.heic', '.webp'):
-        _apply_metadata_tiff(path, date_str, tags, comment, raw_date)
+        _apply_metadata_tiff(path, date_str, tags, comment, raw_date, gps)
     elif ext == '.png':
         _apply_metadata_png(path, date_str, tags, comment, raw_date)
     else:
@@ -210,7 +210,7 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
     except Exception as e:
         print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
 
-def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None):
+def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
     try:
         ext = os.path.splitext(path)[1].lower()
         img = Image.open(path)
@@ -226,6 +226,18 @@ def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None)
             parts.append(f"Raw date: {raw_date}")
         if parts:
             tiff_tags[270] = " | ".join(parts)  # ImageDescription
+        if gps:
+            lat, lon = gps
+            def to_dms_rational(val):
+                d = int(abs(val))
+                m = int((abs(val) - d) * 60)
+                s = round(((abs(val) - d) * 60 - m) * 60 * 100)
+                return ((d, 1), (m, 1), (s, 100))
+            # TIFF GPS IFD tags
+            tiff_tags[1] = b'N' if lat >= 0 else b'S'   # GPSLatitudeRef
+            tiff_tags[2] = to_dms_rational(lat)          # GPSLatitude
+            tiff_tags[3] = b'E' if lon >= 0 else b'W'   # GPSLongitudeRef
+            tiff_tags[4] = to_dms_rational(lon)          # GPSLongitude
         img.save(path, tiffinfo=tiff_tags)
         # iptcinfo3 only supports JPEG — use it for .tif/.tiff only
         if ext in ('.tiff', '.tif'):
