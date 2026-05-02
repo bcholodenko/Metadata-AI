@@ -146,6 +146,21 @@ def run_tesseract(image_path):
 # ---------------------------------------------------------------------------
 # Metadata writers
 # ---------------------------------------------------------------------------
+def _write_iptc_keywords(path, tags, comment):
+    """Writes keywords and caption to IPTC for any format iptcinfo3 supports."""
+    try:
+        info = IPTCInfo(path, force=True)
+        if tags:
+            info['keywords'] = [t.strip().encode('utf-8') for t in tags.split(',')]
+        if comment:
+            info['caption/abstract'] = comment.encode('utf-8')
+        info.save()
+        backup = path + '~'
+        if os.path.exists(backup):
+            os.remove(backup)
+    except Exception as e:
+        print(f"      IPTC keyword write failed: {e}")
+
 def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=None, xmp_only=False):
     ext = os.path.splitext(path)[1].lower()
     if xmp_only or ext == '.dng':
@@ -169,16 +184,9 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
 
         exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = date_str.encode('utf-8')
 
-        user_comment_parts = []
-        if comment:
-            user_comment_parts.append(f"Comment: {comment}")
         if raw_date:
-            user_comment_parts.append(f"Raw date: {raw_date}")
-        if tags:
-            user_comment_parts.append(f"Tags: {tags}")
-        if user_comment_parts:
             exif_dict['Exif'][piexif.ExifIFD.UserComment] = piexif.helper.UserComment.dump(
-                " | ".join(user_comment_parts), encoding="unicode"
+                f"Raw date: {raw_date}", encoding="unicode"
             )
 
         if gps:
@@ -197,19 +205,21 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
 
         exif_bytes = piexif.dump(exif_dict)
         piexif.insert(exif_bytes, path)
+        _write_iptc_keywords(path, tags, comment)
         print(f"   💾 Success: {os.path.basename(path)} updated.")
     except Exception as e:
         print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
 
 def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None):
     try:
+        ext = os.path.splitext(path)[1].lower()
         img = Image.open(path)
         tiff_tags = dict(img.tag_v2) if hasattr(img, 'tag_v2') else {}
         tiff_tags[306] = date_str    # DateTime
         tiff_tags[36867] = date_str  # DateTimeOriginal (EXIF)
         parts = []
         if tags:
-            parts.append(f"Tags: {tags}")
+            parts.append(f"Keywords: {tags}")
         if comment:
             parts.append(f"Comment: {comment}")
         if raw_date:
@@ -217,6 +227,9 @@ def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None)
         if parts:
             tiff_tags[270] = " | ".join(parts)  # ImageDescription
         img.save(path, tiffinfo=tiff_tags)
+        # iptcinfo3 only supports JPEG — use it for .tif/.tiff only
+        if ext in ('.tiff', '.tif'):
+            _write_iptc_keywords(path, tags, comment)
         print(f"   💾 Success: {os.path.basename(path)} updated.")
     except Exception as e:
         print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
@@ -227,15 +240,12 @@ def _apply_metadata_png(path, date_str, tags=None, comment=None, raw_date=None):
         img = Image.open(path)
         info = PngImagePlugin.PngInfo()
         info.add_text("DateTimeOriginal", date_str)
-        parts = []
         if tags:
-            parts.append(f"Tags: {tags}")
+            info.add_text("Keywords", tags)
         if comment:
-            parts.append(f"Comment: {comment}")
+            info.add_text("Description", comment)
         if raw_date:
-            parts.append(f"Raw date: {raw_date}")
-        if parts:
-            info.add_text("Description", " | ".join(parts))
+            info.add_text("RawDate", raw_date)
         img.save(path, pnginfo=info)
         print(f"   💾 Success: {os.path.basename(path)} updated.")
     except Exception as e:
