@@ -16,7 +16,7 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 - Falls back to AI visual date estimation based on fashion, hairstyles, and technology in the image
 - Confidence scoring — low-confidence guesses are sidelined to an HTML review report instead of being written automatically
 - Optional Tesseract OCR pre-processing for improved accuracy on faded or cursive handwriting
-- Optional geotagging via Nominatim — identifies locations from visual landmarks and back-of-photo text, writes GPS coordinates to EXIF
+- Optional EXPERIMENTAL geotagging via Nominatim — identifies locations from visual landmarks and back-of-photo text, writes GPS coordinates to EXIF
 - Writes `DateTimeOriginal` and keyword tags into EXIF metadata
 - Supports `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.png`, `.heic`, `.webp`, and `.dng` files
 - Optional XMP sidecar mode — writes all metadata to `.xmp` files instead of modifying originals
@@ -84,7 +84,7 @@ python metadata-ai.py /path/to/photos
 ### Runtime prompts
 
 ```
-Enter photos directory [./photos]: /Volumes/Pictures/Family
+Enter photos directory [./photos]: /Users/johnappleseed/Pictures/Scans
 Skip photos dated from which year or later? [2010]: 
 Confidence threshold for auto-write (1-10) [7]: 
 Write metadata to XMP sidecar files only? [y/N]: 
