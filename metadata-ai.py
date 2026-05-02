@@ -1,6 +1,9 @@
 import os
+import io
+import sys
 import base64
 import re
+from datetime import datetime
 from natsort import natsorted
 from openai import OpenAI
 import piexif
@@ -10,17 +13,47 @@ from pillow_heif import register_heif_opener
 register_heif_opener()
 
 # Configuration
-DIRECTORY = "./photos" # Folder containing your images
+DIRECTORY = "./photos"         # Folder containing your images
 MODEL_ID = "qwen/qwen3.6-27b" # Must match the model identifier in LM Studio
 CLIENT = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
 
-def get_base64_image(path):
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+# ---------------------------------------------------------------------------
+# Fuzzy date mapping — maps vague decade/era language to YYYY:MM:DD
+# ---------------------------------------------------------------------------
+FUZZY_DATE_PATTERNS = [
+    (r'early\s+(\d{4})s',  lambda m: f"{m.group(1)}:01:01 12:00:00"),
+    (r'mid[- ](\d{4})s',   lambda m: f"{str(int(m.group(1))+5)}:01:01 12:00:00"),
+    (r'late\s+(\d{4})s',   lambda m: f"{str(int(m.group(1))+7)}:01:01 12:00:00"),
+    (r'circa\s+(\d{4})',   lambda m: f"{m.group(1)}:01:01 12:00:00"),
+    (r'c\.\s*(\d{4})',     lambda m: f"{m.group(1)}:01:01 12:00:00"),
+    (r'(\d{4})s',          lambda m: f"{m.group(1)}:01:01 12:00:00"),
+]
 
+def parse_fuzzy_date(text):
+    """Try to extract a normalised EXIF date string from vague text. Returns (date_str, raw_text) or (None, None)."""
+    # First try exact YYYY:MM:DD
+    m = re.search(r'(\d{4})[:/-](\d{2})[:/-](\d{2})', text)
+    if m:
+        return f"{m.group(1)}:{m.group(2)}:{m.group(3)} 12:00:00", None
+
+    # Then exact YYYY:MM
+    m = re.search(r'(\d{4})[:/-](\d{2})', text)
+    if m:
+        return f"{m.group(1)}:{m.group(2)}:01 12:00:00", None
+
+    # Then fuzzy
+    for pattern, formatter in FUZZY_DATE_PATTERNS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return formatter(m), text.strip()
+
+    return None, None
+
+# ---------------------------------------------------------------------------
+# Image helpers
+# ---------------------------------------------------------------------------
 def get_jpeg_base64(image_path):
-    """Converts any supported image to JPEG in memory and returns base64. LM Studio only supports JPEG, PNG, WebP."""
-    import io
+    """Converts any supported image to JPEG in memory. LM Studio only supports JPEG, PNG, WebP."""
     img = Image.open(image_path)
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
@@ -47,59 +80,110 @@ def ask_vlm(image_path, prompt):
         print(f"   API Error: {e}")
         return ""
 
-def apply_metadata(path, date_str, tags=None):
-    """Applies Date Taken and Tags to EXIF. Uses piexif for JPEG, Pillow for TIFF."""
-    ext = os.path.splitext(path)[1].lower()
-    if ext in ('.tiff', '.tif', '.png', '.heic', '.webp'):
-        _apply_metadata_tiff(path, date_str, tags)
-    elif ext == '.dng':
-        _apply_metadata_dng(path, date_str, tags)
-        _apply_metadata_tiff(path, date_str, tags)
-    else:
-        _apply_metadata_jpeg(path, date_str, tags)
+def run_tesseract(image_path):
+    """Runs Tesseract OCR on an image. Returns extracted text or None if Tesseract is not installed."""
+    try:
+        import pytesseract
+        img = Image.open(image_path)
+        return pytesseract.image_to_string(img).strip()
+    except ImportError:
+        return None
+    except Exception:
+        return None
 
-def _apply_metadata_jpeg(path, date_str, tags=None):
-    """Writes EXIF metadata to a JPEG using piexif."""
+# ---------------------------------------------------------------------------
+# Metadata writers
+# ---------------------------------------------------------------------------
+def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=None, xmp_only=False):
+    ext = os.path.splitext(path)[1].lower()
+    if xmp_only or ext == '.dng':
+        _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
+    elif ext in ('.tiff', '.tif', '.png', '.heic', '.webp'):
+        _apply_metadata_tiff(path, date_str, tags, comment, raw_date)
+    else:
+        _apply_metadata_jpeg(path, date_str, tags, comment, raw_date, gps)
+
+def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
     try:
         exif_dict = piexif.load(path)
-
         if 'Exif' not in exif_dict:
             exif_dict['Exif'] = {}
+        if '0th' not in exif_dict:
+            exif_dict['0th'] = {}
 
         exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = date_str.encode('utf-8')
 
+        user_comment_parts = []
+        if comment:
+            user_comment_parts.append(f"Comment: {comment}")
+        if raw_date:
+            user_comment_parts.append(f"Raw date: {raw_date}")
         if tags:
-            exif_dict['Exif'][piexif.ExifIFD.UserComment] = piexif.helper.UserComment.dump(tags, encoding="unicode")
+            user_comment_parts.append(f"Tags: {tags}")
+        if user_comment_parts:
+            exif_dict['Exif'][piexif.ExifIFD.UserComment] = piexif.helper.UserComment.dump(
+                " | ".join(user_comment_parts), encoding="unicode"
+            )
+
+        if gps and 'GPS' not in exif_dict:
+            exif_dict['GPS'] = {}
+        if gps:
+            lat, lon = gps
+            def to_dms(val):
+                d = int(abs(val))
+                m = int((abs(val) - d) * 60)
+                s = round(((abs(val) - d) * 60 - m) * 60 * 100)
+                return [(d, 1), (m, 1), (s, 100)]
+            exif_dict['GPS'][piexif.GPSIFD.GPSLatitudeRef] = b'N' if lat >= 0 else b'S'
+            exif_dict['GPS'][piexif.GPSIFD.GPSLatitude] = to_dms(lat)
+            exif_dict['GPS'][piexif.GPSIFD.GPSLongitudeRef] = b'E' if lon >= 0 else b'W'
+            exif_dict['GPS'][piexif.GPSIFD.GPSLongitude] = to_dms(lon)
 
         exif_bytes = piexif.dump(exif_dict)
         piexif.insert(exif_bytes, path)
-        print(f"   Success: {os.path.basename(path)} updated.")
+        print(f"   💾 Success: {os.path.basename(path)} updated.")
     except Exception as e:
-        print(f"   Metadata Error for {os.path.basename(path)}: {e}")
+        print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
 
-def _apply_metadata_tiff(path, date_str, tags=None):
-    """Writes EXIF metadata to a TIFF using Pillow."""
+def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None):
     try:
         img = Image.open(path)
         tiff_tags = img.tag_v2 if hasattr(img, 'tag_v2') else {}
-        tiff_tags[306] = date_str          # Tag 306 = DateTime
+        tiff_tags[306] = date_str
+        parts = []
         if tags:
-            tiff_tags[270] = tags          # Tag 270 = ImageDescription (keywords)
+            parts.append(f"Tags: {tags}")
+        if comment:
+            parts.append(f"Comment: {comment}")
+        if raw_date:
+            parts.append(f"Raw date: {raw_date}")
+        if parts:
+            tiff_tags[270] = " | ".join(parts)
         img.save(path, tiffinfo=tiff_tags)
-        print(f"   Success: {os.path.basename(path)} updated.")
+        print(f"   💾 Success: {os.path.basename(path)} updated.")
     except Exception as e:
-        print(f"   Metadata Error for {os.path.basename(path)}: {e}")
+        print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
 
-def _apply_metadata_dng(path, date_str, tags=None, comment=None):
-    """Writes metadata for DNG files via XMP sidecar."""
+def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
     try:
         xmp_path = os.path.splitext(path)[0] + ".xmp"
         keywords_xml = ""
         if tags:
             keywords_xml = "".join(
-                f"      <rdf:li>{kw.strip()}</rdf:li>\n" for kw in tags.split(",")
+                f"          <rdf:li>{kw.strip()}</rdf:li>\n" for kw in tags.split(",")
             )
-        comment_xml = f"  <dc:description><rdf:Alt><rdf:li xml:lang='x-default'>{comment}</rdf:li></rdf:Alt></dc:description>\n" if comment else ""
+        comment_parts = []
+        if comment:
+            comment_parts.append(f"Comment: {comment}")
+        if raw_date:
+            comment_parts.append(f"Raw date: {raw_date}")
+        comment_xml = ""
+        if comment_parts:
+            comment_xml = f"      <dc:description><rdf:Alt><rdf:li xml:lang='x-default'>{' | '.join(comment_parts)}</rdf:li></rdf:Alt></dc:description>\n"
+        gps_xml = ""
+        if gps:
+            lat, lon = gps
+            gps_xml = f"      <exif:GPSLatitude>{lat}</exif:GPSLatitude>\n      <exif:GPSLongitude>{lon}</exif:GPSLongitude>\n"
         xmp_content = f"""<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
 <x:xmpmeta xmlns:x='adobe:ns:meta/'>
   <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
@@ -107,7 +191,7 @@ def _apply_metadata_dng(path, date_str, tags=None, comment=None):
                      xmlns:dc='http://purl.org/dc/elements/1.1/'
                      xmlns:exif='http://ns.adobe.com/exif/1.0/'>
       <exif:DateTimeOriginal>{date_str}</exif:DateTimeOriginal>
-{comment_xml}      <dc:subject>
+{gps_xml}{comment_xml}      <dc:subject>
         <rdf:Bag>
 {keywords_xml}        </rdf:Bag>
       </dc:subject>
@@ -119,17 +203,83 @@ def _apply_metadata_dng(path, date_str, tags=None, comment=None):
             f.write(xmp_content)
         print(f"   💾 Success: {os.path.basename(xmp_path)} written.")
     except Exception as e:
-        print(f"   Metadata Error for {os.path.basename(path)}: {e}")
+        print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
 
+# ---------------------------------------------------------------------------
+# Review queue
+# ---------------------------------------------------------------------------
+def write_review_report(folder, review_queue):
+    """Writes an HTML report of low-confidence photos for manual review."""
+    if not review_queue:
+        return
+    report_path = os.path.join(folder, "review.html")
+    rows = ""
+    for item in review_queue:
+        rows += f"""
+        <tr>
+            <td>{item['file']}</td>
+            <td>{item['raw_guess']}</td>
+            <td>{item['confidence']}/10</td>
+            <td>{item.get('comment', '—')}</td>
+        </tr>"""
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Metadata AI — Review Queue</title>
+  <style>
+    body {{ font-family: sans-serif; padding: 2em; }}
+    h1 {{ color: #333; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #ccc; padding: 8px 12px; text-align: left; }}
+    th {{ background: #f0f0f0; }}
+    tr:nth-child(even) {{ background: #fafafa; }}
+  </style>
+</head>
+<body>
+  <h1>📋 Metadata AI — Manual Review Queue</h1>
+  <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {len(review_queue)} photo(s) need review.</p>
+  <table>
+    <thead><tr><th>File</th><th>VLM Date Guess</th><th>Confidence</th><th>Comment</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</body>
+</html>"""
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"\n📋 Review report saved: {report_path}")
 
-def process_archive(folder, cutoff_year=2010):
+# ---------------------------------------------------------------------------
+# Geotagging
+# ---------------------------------------------------------------------------
+def geolocate(location_text):
+    """Queries Nominatim for GPS coordinates. Returns (lat, lon) or None."""
+    try:
+        from geopy.geocoders import Nominatim
+        from geopy.exc import GeocoderTimedOut
+        geolocator = Nominatim(user_agent="metadata-ai")
+        location = geolocator.geocode(location_text, timeout=10)
+        if location:
+            return (location.latitude, location.longitude)
+    except ImportError:
+        print("      geopy not installed — skipping GPS tagging.")
+    except Exception as e:
+        print(f"      Geotagging error: {e}")
+    return None
+
+# ---------------------------------------------------------------------------
+# Main archival loop
+# ---------------------------------------------------------------------------
+def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False):
     if not os.path.exists(folder):
         print(f"Directory {folder} not found.")
         return
 
-    files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(('.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.dng', '.webp'))])
+    files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(
+        ('.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.dng', '.webp'))])
     processed_files = set()
-    
+    review_queue = []
+
     print(f"Starting archival of {len(files)} photos...")
 
     for i in range(len(files)):
@@ -140,6 +290,9 @@ def process_archive(folder, cutoff_year=2010):
         current_path = os.path.join(folder, current_file)
         found_date = None
         found_comment = None
+        raw_date_text = None
+        confidence = 10  # default high for back-of-photo and EXIF dates
+        gps_coords = None
 
         print(f"\n[{i+1}/{len(files)}] Processing: {current_file}")
 
@@ -157,7 +310,6 @@ def process_archive(folder, cutoff_year=2010):
                 "Answer ONLY 'Yes' or 'No'."
             )
             is_back_resp = ask_vlm(next_path, is_back_prompt)
-
             is_back = False
             if is_back_resp.strip().lower().startswith("yes"):
                 confirm_prompt = "Does this image show a photographic scene with people, places, or objects? Answer ONLY 'Yes' or 'No'."
@@ -170,18 +322,25 @@ def process_archive(folder, cutoff_year=2010):
                 print(f"      Back confirmed: {next_file}")
                 processed_files.add(next_file)
 
-                ocr_prompt = "Extract any date written on this photo back. Return ONLY in YYYY:MM:DD format. If no date is present, return 'none'."
+                # Run Tesseract first if available, then feed to VLM
+                ocr_context = run_tesseract(next_path)
+                context_str = f"\n\nOCR pre-extracted text from this image:\n{ocr_context}" if ocr_context else ""
+
+                ocr_prompt = (
+                    f"Extract any date written on this photo back.{context_str} "
+                    "Return ONLY in YYYY:MM:DD format, or a description like 'circa 1950s', 'early 1970s'. "
+                    "If no date is present, return 'none'."
+                )
                 resp = ask_vlm(next_path, ocr_prompt)
-                date_match = re.search(r'(\d{4})[:/-](\d{2})[:/-](\d{2})', resp)
-                if date_match:
-                    found_date = f"{date_match.group(1)}:{date_match.group(2)}:{date_match.group(3)} 12:00:00"
-                    print(f"      Date from back: {found_date}")
+                found_date, raw_date_text = parse_fuzzy_date(resp)
+                if found_date:
+                    print(f"      Date from back: {found_date}" + (f" (fuzzy: {raw_date_text})" if raw_date_text else ""))
                 else:
                     print(f"      No date on back — falling through to VLM guess.")
 
-                # OCR any handwritten comments from the back, translate to English if needed
+                # Extract comments
                 comment_prompt = (
-                    "Extract any handwritten or printed text from this photo back, excluding any dates. "
+                    f"Extract any handwritten or printed text from this photo back, excluding any dates.{context_str} "
                     "If the text is not in English, translate it to English. "
                     "Return only the final English text, or 'none' if there is no text."
                 )
@@ -190,7 +349,6 @@ def process_archive(folder, cutoff_year=2010):
                     found_comment = comment_resp.strip()
                     print(f"      Comment from back: {found_comment}")
                 else:
-                    found_comment = None
                     print(f"      No comment on back.")
             else:
                 print(f"      No back detected.")
@@ -204,26 +362,58 @@ def process_archive(folder, cutoff_year=2010):
                 exif_data = piexif.load(current_path)
                 comment_bytes = exif_data['Exif'].get(piexif.ExifIFD.UserComment, b'')
                 comment = piexif.helper.UserComment.load(comment_bytes) if comment_bytes else ""
-                date_match = re.search(r'(\d{4})[:/-](\d{2})', str(comment))
-                if date_match:
-                    found_date = f"{date_match.group(1)}:{date_match.group(2)}:01 12:00:00"
+                found_date, raw_date_text = parse_fuzzy_date(str(comment))
+                if found_date:
                     print(f"      Date from EXIF: {found_date}")
                 else:
                     print(f"      No date in EXIF.")
             except:
                 print(f"      Could not read EXIF.")
 
-        # Step 3: LLM Visual Guessing
+        # Step 3: VLM visual date guess with confidence score
         if not found_date:
             print(f"   3) Asking VLM to guess date from image content...")
-            guess_prompt = "Analyze fashion and technology in this photo. Estimate year and month. Return ONLY YYYY:MM. Must be before 2010."
+            guess_prompt = (
+                "Analyze the fashion, hairstyles, technology, and setting in this photo. "
+                "Estimate the date as specifically as possible — could be YYYY:MM, YYYY, a decade like '1970s', or 'circa 1965'. "
+                f"The date must be before {cutoff_year}. "
+                "Also provide a confidence score from 1-10 for your estimate. "
+                "Reply in this exact format:\nDATE: <your estimate>\nCONFIDENCE: <score>"
+            )
             resp = ask_vlm(current_path, guess_prompt)
-            date_match = re.search(r'(\d{4})[:/-](\d{2})', resp)
-            if date_match:
-                found_date = f"{date_match.group(1)}:{date_match.group(2)}:01 12:00:00"
-                print(f"      VLM guessed date: {found_date}")
+
+            date_line = re.search(r'DATE:\s*(.+)', resp)
+            conf_line = re.search(r'CONFIDENCE:\s*(\d+)', resp)
+
+            raw_guess = date_line.group(1).strip() if date_line else resp.strip()
+            confidence = int(conf_line.group(1)) if conf_line else 5
+
+            found_date, raw_date_text = parse_fuzzy_date(raw_guess)
+            if found_date:
+                print(f"      VLM guessed date: {found_date} (confidence: {confidence}/10)" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
             else:
                 print(f"      VLM could not determine a date.")
+
+        # Step 3b: Geotagging
+        if enable_geo:
+            print(f"   3b) Checking for location clues...")
+            geo_prompt = (
+                "Look at this photo for any location clues — landmarks, signs, place names, flags, or distinctive geography. "
+                "Also consider any text context provided. "
+                "If you can identify a specific city, region, or landmark, return it as a place name. "
+                "Otherwise return 'none'."
+            )
+            geo_resp = ask_vlm(current_path, geo_prompt)
+            if geo_resp.strip().lower() != "none" and geo_resp.strip():
+                print(f"      Location identified: {geo_resp.strip()}")
+                gps_coords = geolocate(geo_resp.strip())
+                if gps_coords:
+                    print(f"      GPS: {gps_coords[0]:.4f}, {gps_coords[1]:.4f}")
+                else:
+                    print(f"      Could not resolve GPS — storing as text tag.")
+                    found_comment = (found_comment + f" | Location: {geo_resp.strip()}") if found_comment else f"Location: {geo_resp.strip()}"
+            else:
+                print(f"      No location identified.")
 
         # Step 4: Write metadata
         print(f"   4) 💾 Writing metadata...")
@@ -231,17 +421,31 @@ def process_archive(folder, cutoff_year=2010):
             try:
                 year = int(found_date[:4])
                 if year < cutoff_year:
-                    tags_resp = ask_vlm(current_path, "Describe this photo in 5 keywords, comma separated.")
-                    combined_tags = f"{tags_resp} | {found_comment}" if found_comment else tags_resp
-                    apply_metadata(current_path, found_date, combined_tags)
+                    if confidence >= confidence_threshold:
+                        tags_resp = ask_vlm(current_path, "Describe this photo in 5 keywords, comma separated.")
+                        apply_metadata(current_path, found_date, tags=tags_resp, comment=found_comment,
+                                       raw_date=raw_date_text, gps=gps_coords, xmp_only=xmp_only)
+                    else:
+                        print(f"      ⚠️  Low confidence ({confidence}/10) — added to review queue.")
+                        review_queue.append({
+                            "file": current_file,
+                            "raw_guess": raw_date_text or found_date,
+                            "confidence": confidence,
+                            "comment": found_comment or "—"
+                        })
                 else:
                     print(f"      ⏭️  Skipping: date {year} is {cutoff_year} or later.")
-            except: pass
+            except:
+                pass
         else:
             print(f"      ❌ No date found — skipping.")
 
+    write_review_report(folder, review_queue)
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) > 1:
         directory = sys.argv[1]
     else:
@@ -254,4 +458,13 @@ if __name__ == "__main__":
         print("Invalid year, defaulting to 2010.")
         cutoff_year = 2010
 
-    process_archive(directory, cutoff_year)
+    conf_input = input("Confidence threshold for auto-write (1-10) [7]: ").strip()
+    try:
+        confidence_threshold = int(conf_input) if conf_input else 7
+    except ValueError:
+        confidence_threshold = 7
+
+    xmp_only = input("Write metadata to XMP sidecar files only? [y/N]: ").strip().lower() == "y"
+    enable_geo = input("Enable geotagging? [y/N]: ").strip().lower() == "y"
+
+    process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo)
