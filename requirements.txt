@@ -3,3 +3,5 @@ openai
 piexif
 Pillow
 pillow-heif
+pytesseract
+geopy
