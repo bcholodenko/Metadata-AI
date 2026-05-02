@@ -398,20 +398,20 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         else:
             print(f"      No next image to check.")
 
-        # Step 2: Check existing EXIF tags
+        # Step 2: Check IPTC keywords for a date (e.g. "Sep 1960", "Summer 1972")
         if not found_date:
-            print(f"   2) Checking existing EXIF tags...")
-            try:
-                exif_data = piexif.load(current_path)
-                comment_bytes = exif_data['Exif'].get(piexif.ExifIFD.UserComment, b'')
-                comment = piexif.helper.UserComment.load(comment_bytes) if comment_bytes else ""
-                found_date, raw_date_text = parse_fuzzy_date(str(comment))
-                if found_date:
-                    print(f"      Date from EXIF: {found_date}")
-                else:
-                    print(f"      No date in EXIF.")
-            except:
-                print(f"      Could not read EXIF.")
+            print(f"   2) Checking IPTC keywords for date...")
+            _, _, iptc_keywords = get_iptc_metadata(current_path)
+            if iptc_keywords:
+                for keyword in iptc_keywords:
+                    found_date, raw_date_text = parse_fuzzy_date(keyword)
+                    if found_date:
+                        print(f"      Date parsed from IPTC keyword '{keyword}': {found_date}" + (f" (fuzzy: {raw_date_text})" if raw_date_text else ""))
+                        break
+                if not found_date:
+                    print(f"      No date found in IPTC keywords.")
+            else:
+                print(f"      No IPTC keywords found.")
 
         # Step 3: VLM visual date guess with confidence score
         if not found_date:
@@ -435,11 +435,11 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             if found_date:
                 print(f"      VLM guessed date: {found_date} (confidence: {confidence}/10)" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
             else:
-                print(f"      VLM could not determine a date.")
+                print(f"      VLM could not determine a date. Raw response: '{raw_guess}' (confidence: {confidence}/10)")
 
-        # Step 3b: Geotagging
+        # Step 4: Geotagging
         if enable_geo:
-            print(f"   3b) Checking for location clues...")
+            print(f"   4) Checking for location clues...")
             geo_prompt = (
                 "Look at this photo for specific location clues — identifiable landmarks, street signs, place names, flags, or very distinctive geography. "
                 "If you can name a specific city, region, or landmark with confidence, return ONLY that place name, nothing else. "
@@ -465,8 +465,8 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             else:
                 print(f"      No location identified.")
 
-        # Step 4: Write metadata
-        print(f"   4) 💾 Writing metadata...")
+        # Step 5: Write metadata
+        print(f"   5) 💾 Writing metadata...")
         if found_date:
             try:
                 year = int(found_date[:4])
