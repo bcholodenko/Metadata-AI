@@ -220,12 +220,30 @@ def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False):
+EXTENSIONS = ('.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.dng', '.webp')
+
+def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False, recursive=False):
     if not os.path.exists(folder):
         print(f"Directory {folder} not found."); return
 
-    files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(
-        ('.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.dng', '.webp'))])
+    if recursive:
+        all_paths = []
+        for root, _, filenames in os.walk(folder):
+            for f in filenames:
+                if f.lower().endswith(EXTENSIONS):
+                    all_paths.append(os.path.join(root, f))
+        all_paths = natsorted(all_paths)
+        from itertools import groupby
+        for subfolder, path_iter in groupby(all_paths, key=os.path.dirname):
+            subfolder_files = [os.path.basename(p) for p in path_iter]
+            print(f"\n📁 Processing folder: {subfolder} ({len(subfolder_files)} files)")
+            _process_folder(subfolder, subfolder_files, cutoff_year, confidence_threshold, xmp_only, enable_geo)
+        return
+
+    files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(EXTENSIONS)])
+    _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo)
+
+def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo):
     processed_files = set()
     review_queue = []
 
@@ -280,5 +298,6 @@ if __name__ == "__main__":
     confidence_threshold = int(input("Confidence threshold (1-10) [7]: ") or 7)
     xmp_only = input("Write metadata to XMP sidecar files only? [y/N]: ").strip().lower() == "y"
     enable_geo = input("Enable geotagging? [y/N]: ").strip().lower() == "y"
+    recursive = input("Recursively process subfolders? [y/N]: ").strip().lower() == "y"
 
-    process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo)
+    process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo, recursive)
