@@ -1,4 +1,4 @@
-# Metadata-AI
+<img width="1307" height="488" alt="logo" src="https://github.com/user-attachments/assets/8bcf39fd-93c3-4017-96e0-7d692237b197" />
 
 Metadata-AI is a local AI-powered tool that automatically tags and dates scanned physical photographs by writing metadata directly into image files.
 
