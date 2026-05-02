@@ -11,7 +11,7 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 - Detects back-of-photo scans and extracts handwritten dates via OCR
 - Extracts and saves handwritten comments from the back of photos, translating to English if needed
 - Falls back to AI visual date estimation based on fashion and technology in the image
-- Writes `DateTimeOriginal` and keyword tags into EXIF metadata
+- Writes EXIF `DateTimeOriginal` and keyword tags/comments into IPTC metadata
 - Supports `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.png`, `.heic`, `.webp`, and `.dng` files
 - DNG files are written as `.xmp` sidecar files, compatible with Lightroom and Apple Photos
 - All images are converted to JPEG and downscaled to a maximum of 2048px on the long edge before being sent to LM Studio — keeping API calls fast while staying within LM Studio's JPEG/PNG/WebP support
