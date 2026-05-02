@@ -99,7 +99,10 @@ def get_jpeg_base64(image_path):
     explicitly cap the resolution here before encoding — keeping memory use low and
     avoiding unnecessary data being sent to the VLM.
     """
-    img = Image.open(image_path)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        img = Image.open(image_path)
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
 
@@ -148,10 +151,13 @@ def run_tesseract(image_path):
 # ---------------------------------------------------------------------------
 def _write_iptc_keywords(path, tags, comment):
     """Writes keywords and caption to IPTC for any format iptcinfo3 supports."""
+    if not tags and not comment:
+        return
     try:
         info = IPTCInfo(path, force=True)
         if tags:
-            info['keywords'] = [t.strip().encode('utf-8') for t in tags.split(',')]
+            keywords = [t.strip() for t in tags.split(',') if t.strip()]
+            info['keywords'] = [k.encode('utf-8') for k in keywords]
         if comment:
             info['caption/abstract'] = comment.encode('utf-8')
         info.save()
@@ -246,17 +252,13 @@ def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None,
         if parts:
             tiff_tags[270] = " | ".join(parts)  # ImageDescription
         if gps:
+            # Store GPS as plain decimal strings in ImageDescription rather than
+            # attempting TIFF GPS IFD rational encoding, which Pillow does not
+            # support reliably via tag_v2. XMP sidecar is the robust path for GPS
+            # on TIFF; here we at least preserve the coordinates as readable text.
             lat, lon = gps
-            def to_dms_rational(val):
-                d = int(abs(val))
-                m = int((abs(val) - d) * 60)
-                s = round(((abs(val) - d) * 60 - m) * 60 * 100)
-                return ((d, 1), (m, 1), (s, 100))
-            # TIFF GPS IFD tags
-            tiff_tags[1] = b'N' if lat >= 0 else b'S'   # GPSLatitudeRef
-            tiff_tags[2] = to_dms_rational(lat)          # GPSLatitude
-            tiff_tags[3] = b'E' if lon >= 0 else b'W'   # GPSLongitudeRef
-            tiff_tags[4] = to_dms_rational(lon)          # GPSLongitude
+            gps_str = f"GPS: {lat:.6f}, {lon:.6f}"
+            tiff_tags[270] = (tiff_tags.get(270, "") + " | " + gps_str).lstrip(" | ")
         img.save(path, tiffinfo=tiff_tags)
         print(f"   💾 Success: {os.path.basename(path)} updated.")
     except Exception as e:
