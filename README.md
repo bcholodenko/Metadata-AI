@@ -108,9 +108,9 @@ If you scanned the backs of photos, place them immediately after the front in fi
 | Format | Metadata method |
 |---|---|
 | `.jpg`, `.jpeg` | piexif (EXIF date + GPS) + iptcinfo3 (IPTC keywords + caption) |
-| `.tiff`, `.tif` | piexif (EXIF date + GPS) + iptcinfo3 (IPTC keywords + caption) |
+| `.tiff`, `.tif` | XMP sidecar file |
 | `.png` | PNG text chunks (date, keywords, caption) |
-| `.heic`, `.webp` | Pillow TIFF tags (date + ImageDescription) |
+| `.heic`, `.webp` | PNG text chunks (date, keywords, caption) |
 | `.dng` | XMP sidecar file |
 
 ---
