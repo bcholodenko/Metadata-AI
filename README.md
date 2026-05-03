@@ -1,7 +1,5 @@
 <img width="600" alt="logo" src="https://github.com/user-attachments/assets/8bcf39fd-93c3-4017-96e0-7d692237b197" />
 
-# Metadata-AI
-
 Metadata-AI is a local AI-powered tool that automatically tags and dates scanned physical photographs by writing metadata directly into image files.
 
 It uses a vision language model (VLM) running locally via [LM Studio](https://lmstudio.ai) to analyze each photo, detect whether the next scanned image is the back of a photograph, extract handwritten dates and comments via OCR (translating to English if needed), and estimate dates from visual cues like fashion and technology when no written date is available.
@@ -12,7 +10,7 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 
 - Detects back-of-photo scans and extracts handwritten dates via OCR
 - Extracts and saves handwritten comments from the back of photos, translating to English if needed
-- Passes the folder name to the VLM as context for date and location hints (e.g. `8-79 Hawaii` → August 1979, Hawaii)
+- Passes the folder name to the VLM as high-confidence date and location information (e.g. `8-79 Hawaii` → August 1979, Hawaii)
 - Single VLM call per photo extracts date, time of day, scene description, indoor/outdoor setting, flash, keywords, and location — minimizing processing time
 - Writes `DateTimeOriginal` into EXIF and keywords/captions into IPTC metadata
 - Optionally geotags photos by identifying locations from visual clues and resolving GPS coordinates via Nominatim
@@ -51,6 +49,8 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
    ```
 
    > **Note:** HEIC support requires `pillow-heif`, which is included in `requirements.txt`. On some systems you may also need `libheif` installed via Homebrew: `brew install libheif`
+
+   > **Optional:** Install `pytesseract` and [Tesseract](https://github.com/tesseract-ocr/tesseract) to enable OCR on the backs of photos for handwritten date extraction. Without it, the VLM handles back-of-photo text alone. To enable: `pip install pytesseract` and `brew install tesseract`
 
 3. Open LM Studio, load a vision-capable model, and start the local server (default: `http://localhost:1234`).
 
@@ -102,7 +102,7 @@ If you scanned the backs of photos, place them immediately after the front in fi
 
 1. **Back detection** — For each photo, the script checks if the next image is the reverse side of a physical print using a two-step VLM confirmation. If confirmed, it attempts to OCR a date and any handwritten comments from the back. Comments are translated to English if needed. If no date is found on the back, the script falls through to step 2.
 2. **IPTC keyword check** — Checks existing IPTC keywords on the photo for a parseable date (e.g. "Sep 1960" or "circa 1975").
-3. **AI analysis** — A single VLM call analyzes the image and returns all of the following in one pass: date estimate and confidence (if date is still unknown), time of day from lighting and shadows, a one-sentence scene description, indoor/outdoor setting, whether flash fired, location clues (if geotagging is enabled), and 5 descriptive keywords. The folder name is always passed as context so the VLM can use it as a date or location hint. The estimated time is written into the `DateTimeOriginal` EXIF timestamp.
+3. **AI analysis** — A single VLM call analyzes the image and returns all of the following in one pass: date estimate and confidence (if date is still unknown), time of day from lighting and shadows, a one-sentence scene description, indoor/outdoor setting, whether flash fired, location clues (if geotagging is enabled), and 5 descriptive keywords. The folder name is always passed as high-confidence date and location information for the VLM to weight accordingly. The estimated time is written into the `DateTimeOriginal` EXIF timestamp.
 4. **Geotagging** — If enabled, uses the location returned by the VLM in step 3 and resolves it to GPS coordinates via Nominatim.
 5. **Keywords** — Confirmed from the VLM's step 3 response — no additional call needed.
 6. **Metadata writing** — Valid dates before the cutoff year are written into the file along with the generated keywords and any comments extracted from the back. Low-confidence estimates are added to a `review.html` report instead of being written. DNG files receive a `.xmp` sidecar instead of direct EXIF modification.
