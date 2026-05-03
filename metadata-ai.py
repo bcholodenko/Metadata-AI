@@ -7,8 +7,6 @@ import logging
 from datetime import datetime
 from natsort import natsorted
 from openai import OpenAI
-import piexif
-import piexif.helper
 from PIL import Image
 from pillow_heif import register_heif_opener
 from iptcinfo3 import IPTCInfo
@@ -154,24 +152,6 @@ def run_tesseract(image_path):
 # ---------------------------------------------------------------------------
 # Metadata writers
 # ---------------------------------------------------------------------------
-def _write_iptc_keywords(path, tags, comment):
-    """Writes keywords and caption to IPTC for any format iptcinfo3 supports."""
-    if not tags and not comment:
-        return
-    try:
-        info = IPTCInfo(path, force=True)
-        if tags:
-            keywords = [t.strip() for t in tags.split(',') if t.strip()]
-            info['keywords'] = [k.encode('utf-8') for k in keywords]
-        if comment:
-            info['caption/abstract'] = comment.encode('utf-8')
-        info.save()
-        backup = path + '~'
-        if os.path.exists(backup):
-            os.remove(backup)
-    except Exception as e:
-        print(f"      IPTC keyword write failed: {e}")
-
 def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=None, xmp_only=False):
     ext = os.path.splitext(path)[1].lower()
     if xmp_only or ext == '.dng':
@@ -186,8 +166,7 @@ def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=N
         print(f"   ⚠️ Unsupported format for metadata writing: {ext}")
 
 def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
-    # XMP+ExifTool approach for consistency and to avoid the two-pass
-    # iptcinfo3+piexif corruption risk.
+    # XMP+ExifTool approach for consistency and to avoid any
     import shutil, subprocess
     xmp_path = os.path.splitext(path)[0] + ".xmp"
     _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
