@@ -29,7 +29,7 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 
 - Python 3.8+
 - [LM Studio](https://lmstudio.ai) running locally with a vision-capable model loaded
-- [ExifTool](https://exiftool.org) for writing metadata into `.tiff`/`.tif` files (`brew install exiftool`)
+- [ExifTool](https://exiftool.org) for writing metadata into all image formats (`brew install exiftool`)
 
 ---
 
@@ -109,7 +109,7 @@ If you scanned the backs of photos, place them immediately after the front in fi
 | Format | Metadata method |
 |---|---|
 | `.jpg`, `.jpeg` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
-| `.tiff`, `.tif` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted after merge) |
+| `.tiff`, `.tif` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
 | `.png` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
 | `.heic`, `.webp` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
 | `.dng` | XMP sidecar file |
