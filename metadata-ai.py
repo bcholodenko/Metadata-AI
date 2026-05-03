@@ -34,7 +34,8 @@ DIRECTORY = "./photos"         # Folder containing your images
 MODEL_ID = "qwen/qwen3.6-27b" # Must match the model identifier in LM Studio
 CLIENT = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
 
-EXTENSIONS = ('.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.dng', '.webp')
+EXTENSIONS = ('.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic', '.dng', '.webp', '.cr2', '.cr3', '.nef', '.arw', '.raf', '.orf', '.rw2', '.raw')
+RAW_EXTENSIONS = ('.cr2', '.cr3', '.nef', '.arw', '.raf', '.orf', '.rw2', '.raw')
 
 # ---------------------------------------------------------------------------
 # Fuzzy date mapping — maps vague decade/era language to YYYY:MM:DD
@@ -99,12 +100,25 @@ def get_jpeg_base64(image_path):
     bomb guard is disabled at module level (Image.MAX_IMAGE_PIXELS = None), so we
     explicitly cap the resolution here before encoding — keeping memory use low and
     avoiding unnecessary data being sent to the VLM.
+
+    Raw formats (.cr2, .cr3, .nef, etc.) are decoded via rawpy if available.
     """
     import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        img = Image.open(image_path)
-        img.load()  # Force full decode inside the suppression block
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext in RAW_EXTENSIONS:
+        try:
+            import rawpy
+            import numpy as np
+            with rawpy.imread(image_path) as raw:
+                rgb = raw.postprocess(use_camera_wb=True, output_bps=8)
+            img = Image.fromarray(rgb)
+        except ImportError:
+            raise RuntimeError("rawpy is required to open raw files. Install it with: pip install rawpy")
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            img = Image.open(image_path)
+            img.load()  # Force full decode inside the suppression block
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
 
@@ -157,7 +171,7 @@ def run_tesseract(image_path):
 # ---------------------------------------------------------------------------
 def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=None, xmp_only=False, scene=None, setting=None, flash=None):
     ext = os.path.splitext(path)[1].lower()
-    if xmp_only or ext == '.dng':
+    if xmp_only or ext in ('.dng',) + RAW_EXTENSIONS:
         _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
     elif ext in ('.jpg', '.jpeg'):
         _apply_metadata_jpeg(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
