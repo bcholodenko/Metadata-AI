@@ -11,7 +11,7 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 - Detects back-of-photo scans and extracts handwritten dates via OCR
 - Extracts and saves handwritten comments from the back of photos, translating to English if needed
 - Parses dates and location hints from folder names (e.g. `7-3-87`, `8-26 to 8-30-87 Hawaii`)
-- Falls back to AI visual date estimation based on fashion and technology in the image
+- Falls back to AI visual date and time-of-day estimation based on fashion, technology, lighting, and shadows
 - Writes `DateTimeOriginal` into EXIF and keywords/captions into IPTC metadata
 - Optionally geotags photos by identifying locations from visual clues, folder names, and resolving GPS coordinates
 - Low-confidence date estimates are skipped and logged to a `review.html` report for manual review
@@ -99,7 +99,7 @@ If you scanned the backs of photos, place them immediately after the front in fi
 
 1. **Back detection** — For each photo, the script checks if the next image is the reverse side of a physical print using a two-step VLM confirmation. If confirmed, it attempts to OCR a date and any handwritten comments from the back. Comments are translated to English if needed. If no date is found on the back, the script falls through to step 2.
 2. **Folder name and IPTC keyword check** — Parses the folder name for a date (e.g. `7-3-87` → July 3, 1987) and a location hint (e.g. `Hawaii`). If no folder date is found, checks existing IPTC keywords for a parseable date (e.g. "Sep 1960" or "circa 1975").
-3. **AI visual estimation** — If still no date, the VLM analyzes fashion, technology, and other visual cues to estimate the year and month, along with a confidence score. Any folder date or location hint is passed as context to improve accuracy.
+3. **AI visual estimation** — If still no date, the VLM analyzes fashion, technology, and other visual cues to estimate the year and month, along with a time of day (inferred from lighting, shadows, and context) and a confidence score. Any folder date or location hint is passed as context to improve accuracy. The estimated time is written into the `DateTimeOriginal` EXIF timestamp.
 4. **Geotagging** — If enabled, the VLM looks for identifiable location clues in the image. If none are found, falls back to any location hint extracted from the folder name. Locations are resolved to GPS coordinates via Nominatim.
 5. **Metadata writing** — Valid dates before the cutoff year are written into the file along with AI-generated keyword tags and any comments extracted from the back. Low-confidence estimates are added to a `review.html` report instead of being written. DNG files receive a `.xmp` sidecar instead of direct EXIF modification.
 
