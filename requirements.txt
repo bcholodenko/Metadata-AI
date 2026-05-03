@@ -2,7 +2,10 @@ natsort
 openai
 Pillow
 pillow-heif
-pytesseract
 geopy
 iptcinfo3
 rawpy
+numpy
+
+# Optional — enables OCR on backs of photos for handwritten date extraction
+# pytesseract
