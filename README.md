@@ -10,10 +10,10 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 
 - Detects back-of-photo scans and extracts handwritten dates via OCR
 - Extracts and saves handwritten comments from the back of photos, translating to English if needed
-- Parses dates and location hints from folder names (e.g. `7-3-87`, `8-26 to 8-30-87 Hawaii`)
+- Passes the folder name to the VLM as context for date and location hints (e.g. `8-79 Hawaii` → August 1979, Hawaii)
 - Single VLM call per photo extracts date, time of day, scene description, indoor/outdoor setting, flash, keywords, and location — minimizing processing time
 - Writes `DateTimeOriginal` into EXIF and keywords/captions into IPTC metadata
-- Optionally geotags photos by identifying locations from visual clues, folder names, and resolving GPS coordinates
+- Optionally geotags photos by identifying locations from visual clues and resolving GPS coordinates via Nominatim
 - Low-confidence date estimates are skipped and logged to a `review.html` report for manual review
 - Supports `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.png`, `.heic`, `.webp`, and `.dng` files
 - DNG files are written as `.xmp` sidecar files, compatible with Lightroom and Apple Photos
@@ -98,9 +98,9 @@ If you scanned the backs of photos, place them immediately after the front in fi
 ## How It Works
 
 1. **Back detection** — For each photo, the script checks if the next image is the reverse side of a physical print using a two-step VLM confirmation. If confirmed, it attempts to OCR a date and any handwritten comments from the back. Comments are translated to English if needed. If no date is found on the back, the script falls through to step 2.
-2. **Folder name and IPTC keyword check** — Parses the folder name for a date (e.g. `7-3-87` → July 3, 1987) and a location hint (e.g. `Hawaii`). If no folder date is found, checks existing IPTC keywords for a parseable date (e.g. "Sep 1960" or "circa 1975").
-3. **AI analysis** — A single VLM call analyzes the image and returns all of the following in one pass: date estimate and confidence (if date is still unknown), time of day from lighting and shadows, a one-sentence scene description, indoor/outdoor setting, whether flash fired, location clues (if geotagging is enabled), and 5 descriptive keywords. Any folder date or location hint is included as context. The estimated time is written into the `DateTimeOriginal` EXIF timestamp.
-4. **Geotagging** — If enabled, uses the location returned by the VLM in step 3. If none was identified, falls back to any location hint extracted from the folder name. Locations are resolved to GPS coordinates via Nominatim.
+2. **IPTC keyword check** — Checks existing IPTC keywords on the photo for a parseable date (e.g. "Sep 1960" or "circa 1975").
+3. **AI analysis** — A single VLM call analyzes the image and returns all of the following in one pass: date estimate and confidence (if date is still unknown), time of day from lighting and shadows, a one-sentence scene description, indoor/outdoor setting, whether flash fired, location clues (if geotagging is enabled), and 5 descriptive keywords. The folder name is always passed as context so the VLM can use it as a date or location hint. The estimated time is written into the `DateTimeOriginal` EXIF timestamp.
+4. **Geotagging** — If enabled, uses the location returned by the VLM in step 3 and resolves it to GPS coordinates via Nominatim.
 5. **Keywords** — Confirmed from the VLM's step 3 response — no additional call needed.
 6. **Metadata writing** — Valid dates before the cutoff year are written into the file along with the generated keywords and any comments extracted from the back. Low-confidence estimates are added to a `review.html` report instead of being written. DNG files receive a `.xmp` sidecar instead of direct EXIF modification.
 
