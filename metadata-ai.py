@@ -3,6 +3,9 @@ import io
 import sys
 import base64
 import re
+
+# Force line-buffered output so progress prints appear immediately in the terminal
+sys.stdout.reconfigure(line_buffering=True)
 import logging
 from datetime import datetime
 from natsort import natsorted
@@ -513,7 +516,9 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 else:
                     print(f"      No IPTC keywords found.")
 
-        # Step 3: VLM visual date guess with confidence score
+        # Step 3: VLM visual date guess (and always time-of-day estimation)
+        # If date already known, skip date guessing but still ask for time of day.
+        raw_time = None
         if not found_date:
             print(f"   3) Asking VLM to guess date from image content...")
             folder_context = ""
@@ -542,21 +547,33 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
 
             found_date, raw_date_text = parse_fuzzy_date(raw_guess)
 
-            # Parse time estimate into an hour for the EXIF timestamp
-            if raw_time:
-                time_hour = _parse_time_of_day(raw_time)
-            else:
-                time_hour = 12  # default noon
-
-            # Replace the placeholder hour in found_date with the estimated hour
-            if found_date and time_hour is not None:
-                found_date = found_date[:11] + f"{time_hour:02d}:00:00"
-
             if found_date:
                 time_str = f" (~{raw_time})" if raw_time else ""
                 print(f"      VLM guessed date: {found_date} (confidence: {confidence}/10){time_str}" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
             else:
                 print(f"      VLM could not determine a date. Raw response: '{raw_guess}' (confidence: {confidence}/10)")
+        else:
+            print(f"   3) Asking VLM to estimate time of day...")
+            time_prompt = (
+                "Look at the lighting, shadows, and context in this photo. "
+                "Estimate the time of day — e.g. 'morning', 'midday', 'afternoon', 'evening', or a specific time like '3pm'. "
+                "Reply in this exact format:\nTIME: <your estimate>"
+            )
+            time_resp = ask_vlm(current_path, time_prompt)
+            time_line = re.search(r'TIME:\s*(.+)', time_resp)
+            raw_time = time_line.group(1).strip() if time_line else None
+            if raw_time:
+                print(f"      VLM estimated time: {raw_time}")
+            else:
+                print(f"      VLM could not estimate time of day.")
+
+        # Apply estimated time of day to the date string
+        time_hour = _parse_time_of_day(raw_time) if raw_time else 12
+        if found_date:
+            found_date = found_date[:11] + f"{time_hour:02d}:00:00"
+            if raw_time:
+                time_str = f" (~{raw_time})"
+                print(f"      Final timestamp: {found_date}{time_str}")
 
         # Step 4: Geotagging
         if enable_geo:
@@ -595,14 +612,26 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 else:
                     print(f"      No location identified.")
 
-        # Step 5: Write metadata
-        print(f"   5) 💾 Writing metadata...")
+        # Step 5: Generate keywords
+        tags_resp = None
+        if found_date:
+            try:
+                year = int(found_date[:4])
+                if year < cutoff_year and confidence >= confidence_threshold:
+                    print(f"   5) Generating keywords...")
+                    tags_resp = ask_vlm(current_path, "Describe this photo in 5 keywords, comma separated.")
+                    if tags_resp:
+                        print(f"      Keywords: {tags_resp.strip()}")
+            except:
+                pass
+
+        # Step 6: Write metadata
+        print(f"   6) 💾 Writing metadata...")
         if found_date:
             try:
                 year = int(found_date[:4])
                 if year < cutoff_year:
                     if confidence >= confidence_threshold:
-                        tags_resp = ask_vlm(current_path, "Describe this photo in 5 keywords, comma separated.")
                         apply_metadata(current_path, found_date, tags=tags_resp, comment=found_comment,
                                        raw_date=raw_date_text, gps=gps_coords, xmp_only=xmp_only)
                     else:
