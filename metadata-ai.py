@@ -168,13 +168,13 @@ def run_tesseract(image_path):
 def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=None, xmp_only=False):
     ext = os.path.splitext(path)[1].lower()
     if xmp_only or ext == '.dng':
-        _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
+        _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
     elif ext in ('.jpg', '.jpeg'):
         _apply_metadata_jpeg(path, date_str, tags, comment, raw_date, gps)
     elif ext in ('.tiff', '.tif'):
         _apply_metadata_tiff(path, date_str, tags, comment, raw_date, gps)
     elif ext in ('.png', '.heic', '.webp'):
-        _apply_metadata_png(path, date_str, tags, comment, raw_date, gps)
+        _apply_metadata_png(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
     else:
         print(f"   ⚠️ Unsupported format for metadata writing: {ext}")
 
@@ -182,7 +182,7 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
     # XMP+ExifTool approach for consistency and to avoid any
     import shutil, subprocess
     xmp_path = os.path.splitext(path)[0] + ".xmp"
-    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
+    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
 
     if shutil.which("exiftool") is None:
         print(f"      ⚠️ ExifTool not found — XMP sidecar kept at {os.path.basename(xmp_path)}")
@@ -201,13 +201,13 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
     except Exception as e:
         print(f"      ⚠️ ExifTool error — XMP sidecar kept: {e}")
 
-def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
+def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None, gps=None, scene=None, setting=None, flash=None):
     # Write XMP sidecar first, then use ExifTool to merge it safely into the TIFF's
     # EXIF without re-encoding any pixel data. If ExifTool is not available, the XMP
     # sidecar is kept as a fallback.
     import shutil, subprocess
     xmp_path = os.path.splitext(path)[0] + ".xmp"
-    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
+    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
 
     if shutil.which("exiftool") is None:
         print(f"      ⚠️ ExifTool not found — XMP sidecar kept at {os.path.basename(xmp_path)}")
@@ -227,11 +227,11 @@ def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None,
         print(f"      ⚠️ ExifTool error — XMP sidecar kept: {e}")
 
 
-def _apply_metadata_png(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
+def _apply_metadata_png(path, date_str, tags=None, comment=None, raw_date=None, gps=None, scene=None, setting=None, flash=None):
     # Same XMP+ExifTool approach as TIFF — avoids re-encoding pixel data.
     import shutil, subprocess
     xmp_path = os.path.splitext(path)[0] + ".xmp"
-    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
+    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
 
     if shutil.which("exiftool") is None:
         print(f"      ⚠️ ExifTool not found — XMP sidecar kept at {os.path.basename(xmp_path)}")
@@ -250,7 +250,7 @@ def _apply_metadata_png(path, date_str, tags=None, comment=None, raw_date=None, 
     except Exception as e:
         print(f"      ⚠️ ExifTool error — XMP sidecar kept: {e}")
 
-def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
+def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, gps=None, scene=None, setting=None, flash=None):
     try:
         xmp_path = os.path.splitext(path)[0] + ".xmp"
         keywords_xml = ""
@@ -516,76 +516,96 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 else:
                     print(f"      No IPTC keywords found.")
 
-        # Step 3: VLM visual date guess (and always time-of-day estimation)
-        # If date already known, skip date guessing but still ask for time of day.
+        # Step 3: Single VLM call — date (if unknown), time, scene, setting, flash,
+        # location (if geotagging enabled), and keywords. Combining into one prompt
+        # eliminates multiple round-trips to the model.
         raw_time = None
-        if not found_date:
-            print(f"   3) Asking VLM to guess date from image content...")
-            folder_context = ""
-            if folder_date:
-                folder_context += f"The folder containing this photo is named '{folder_name}', suggesting the date is around {folder_date[:4]}. "
-            if folder_location:
-                folder_context += f"The folder name also suggests the location may be '{folder_location}'. "
-            guess_prompt = (
-                "Analyze the fashion, hairstyles, technology, and setting in this photo. "
-                f"{folder_context}"
-                "Estimate the date as specifically as possible — could be YYYY:MM, YYYY, a decade like '1970s', or 'circa 1965'. "
-                f"The date must be before {cutoff_year}. "
-                "Also estimate the time of day based on lighting, shadows, and context — e.g. 'morning', 'midday', 'afternoon', 'evening', or a specific time like '3pm'. "
-                "Also provide a confidence score from 1-10 for your estimate. "
-                "Reply in this exact format:\nDATE: <your estimate>\nTIME: <your estimate>\nCONFIDENCE: <score>"
-            )
-            resp = ask_vlm(current_path, guess_prompt)
+        vlm_scene = None
+        vlm_setting = None
+        vlm_flash = None
+        tags_resp = None
+        geo_resp_inline = None
 
-            date_line = re.search(r'DATE:\s*(.+)', resp)
-            time_line = re.search(r'TIME:\s*(.+)', resp)
-            conf_line = re.search(r'CONFIDENCE:\s*(\d+)', resp)
+        print(f"   3) Asking VLM to analyze image...")
 
-            raw_guess = date_line.group(1).strip() if date_line else resp.strip()
-            raw_time = time_line.group(1).strip() if time_line else None
+        folder_context = ""
+        if folder_date:
+            folder_context += f"The folder containing this photo is named '{folder_name}', suggesting the date is around {folder_date[:4]}. "
+        if folder_location:
+            folder_context += f"The folder name also suggests the location may be '{folder_location}'. "
+
+        geo_instruction = (
+            "LOCATION: <specific city, region, or landmark if clearly identifiable — otherwise 'none'>\n"
+        ) if enable_geo else ""
+
+        date_instruction = (
+            "Analyze the fashion, hairstyles, technology, and setting in this photo. "
+            f"{folder_context}"
+            "Estimate the date as specifically as possible — could be YYYY:MM, YYYY, a decade like '1970s', or 'circa 1965'. "
+            f"The date must be before {cutoff_year}. "
+            "Also provide a confidence score from 1-10 for your date estimate.\n"
+            "DATE: <your estimate>\n"
+            "CONFIDENCE: <score>\n"
+        ) if not found_date else ""
+
+        full_prompt = (
+            f"{date_instruction}"
+            "Also answer the following:\n"
+            "TIME: <time of day — e.g. 'morning', 'midday', 'afternoon', 'evening', or '3pm'>\n"
+            "SCENE: <one sentence describing the scene>\n"
+            "SETTING: <'indoor' or 'outdoor'>\n"
+            "FLASH: <'yes' or 'no' — whether flash appears to have fired>\n"
+            f"{geo_instruction}"
+            "KEYWORDS: <5 descriptive keywords, comma separated>"
+        )
+
+        resp = ask_vlm(current_path, full_prompt)
+
+        # Parse all fields from the single response
+        date_line    = re.search(r'DATE:\s*(.+)',       resp)
+        conf_line    = re.search(r'CONFIDENCE:\s*(\d+)', resp)
+        time_line    = re.search(r'TIME:\s*(.+)',       resp)
+        scene_line   = re.search(r'SCENE:\s*(.+)',      resp)
+        setting_line = re.search(r'SETTING:\s*(.+)',    resp)
+        flash_line   = re.search(r'FLASH:\s*(.+)',      resp)
+        geo_line     = re.search(r'LOCATION:\s*(.+)',   resp) if enable_geo else None
+        keywords_line = re.search(r'KEYWORDS:\s*(.+)',  resp)
+
+        if not found_date and date_line:
+            raw_guess = date_line.group(1).strip()
             confidence = int(conf_line.group(1)) if conf_line else 5
-
             found_date, raw_date_text = parse_fuzzy_date(raw_guess)
-
             if found_date:
-                time_str = f" (~{raw_time})" if raw_time else ""
-                print(f"      VLM guessed date: {found_date} (confidence: {confidence}/10){time_str}" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
+                print(f"      Date:       {found_date} (confidence: {confidence}/10)" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
             else:
                 print(f"      VLM could not determine a date. Raw response: '{raw_guess}' (confidence: {confidence}/10)")
-        else:
-            print(f"   3) Asking VLM to estimate time of day...")
-            time_prompt = (
-                "Look at the lighting, shadows, and context in this photo. "
-                "Estimate the time of day — e.g. 'morning', 'midday', 'afternoon', 'evening', or a specific time like '3pm'. "
-                "Reply in this exact format:\nTIME: <your estimate>"
-            )
-            time_resp = ask_vlm(current_path, time_prompt)
-            time_line = re.search(r'TIME:\s*(.+)', time_resp)
-            raw_time = time_line.group(1).strip() if time_line else None
-            if raw_time:
-                print(f"      VLM estimated time: {raw_time}")
-            else:
-                print(f"      VLM could not estimate time of day.")
+
+        raw_time    = time_line.group(1).strip()             if time_line    else None
+        vlm_scene   = scene_line.group(1).strip()            if scene_line   else None
+        vlm_setting = setting_line.group(1).strip()          if setting_line else None
+        vlm_flash   = flash_line.group(1).strip().lower()    if flash_line   else None
+        tags_resp   = keywords_line.group(1).strip()         if keywords_line else None
+        geo_resp_inline = geo_line.group(1).strip()          if geo_line     else None
+
+        if raw_time:    print(f"      Time:       {raw_time}")
+        if vlm_scene:   print(f"      Scene:      {vlm_scene}")
+        if vlm_setting: print(f"      Setting:    {vlm_setting}")
+        if vlm_flash:   print(f"      Flash:      {vlm_flash}")
+        if tags_resp:   print(f"      Keywords:   {tags_resp}")
 
         # Apply estimated time of day to the date string
         time_hour = _parse_time_of_day(raw_time) if raw_time else 12
         if found_date:
             found_date = found_date[:11] + f"{time_hour:02d}:00:00"
             if raw_time:
-                time_str = f" (~{raw_time})"
-                print(f"      Final timestamp: {found_date}{time_str}")
+                print(f"      Timestamp:  {found_date} (~{raw_time})")
 
-        # Step 4: Geotagging
+        # Step 4: Geotagging — use inline location from VLM if available, else folder hint
         if enable_geo:
             print(f"   4) Checking for location clues...")
-            geo_prompt = (
-                "Look at this photo for specific location clues — identifiable landmarks, street signs, place names, flags, or very distinctive geography. "
-                "If you can name a specific city, region, or landmark with confidence, return ONLY that place name, nothing else. "
-                "If there are no clear location clues, return ONLY the word 'none'."
-            )
-            geo_resp = ask_vlm(current_path, geo_prompt).strip()
+            geo_resp = geo_resp_inline or ""
             is_valid_location = (
-                geo_resp.lower() != "none"
+                geo_resp.lower() not in ("", "none")
                 and len(geo_resp) < 100
                 and not any(phrase in geo_resp.lower() for phrase in [
                     "no identifiable", "no clear", "cannot identify", "unable to",
@@ -612,18 +632,11 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 else:
                     print(f"      No location identified.")
 
-        # Step 5: Generate keywords
-        tags_resp = None
-        if found_date:
-            try:
-                year = int(found_date[:4])
-                if year < cutoff_year and confidence >= confidence_threshold:
-                    print(f"   5) Generating keywords...")
-                    tags_resp = ask_vlm(current_path, "Describe this photo in 5 keywords, comma separated.")
-                    if tags_resp:
-                        print(f"      Keywords: {tags_resp.strip()}")
-            except:
-                pass
+        # Step 5: Keywords already generated in step 3 — just confirm or skip
+        if tags_resp:
+            print(f"   5) Keywords from VLM analysis: {tags_resp}")
+        else:
+            print(f"   5) No keywords returned by VLM.")
 
         # Step 6: Write metadata
         print(f"   6) 💾 Writing metadata...")
