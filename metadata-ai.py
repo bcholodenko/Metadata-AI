@@ -103,6 +103,7 @@ def get_jpeg_base64(image_path):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         img = Image.open(image_path)
+        img.load()  # Force full decode inside the suppression block
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
 
@@ -120,6 +121,10 @@ def ask_vlm(image_path, prompt):
     """Sends an image to LM Studio as JPEG regardless of source format."""
     try:
         base64_image = get_jpeg_base64(image_path)
+    except Exception as e:
+        print(f"      Could not open image {os.path.basename(image_path)}: {e}")
+        return ""
+    try:
         response = CLIENT.chat.completions.create(
             model=MODEL_ID,
             messages=[{
@@ -132,7 +137,7 @@ def ask_vlm(image_path, prompt):
         )
         return response.choices[0].message.content
     except Exception as e:
-        print(f"   API Error: {e}")
+        print(f"      VLM request failed: {e}")
         return ""
 
 def run_tesseract(image_path):
@@ -229,19 +234,12 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
         print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
 
 def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
+    # Use piexif to write directly into the TIFF's EXIF block without re-encoding
+    # any image data. Pillow's img.save() re-encodes pixels and corrupts some TIFFs
+    # (black regions, color shifts). piexif.insert() patches only the metadata bytes.
+    import warnings
     try:
-        ext = os.path.splitext(path)[1].lower()
-        # Suppress corrupt EXIF warnings and fall back to clean tags if needed
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            img = Image.open(path)
-        try:
-            tiff_tags = dict(img.tag_v2) if hasattr(img, 'tag_v2') else {}
-        except Exception:
-            tiff_tags = {}
-        tiff_tags[306] = date_str    # DateTime
-        tiff_tags[36867] = date_str  # DateTimeOriginal (EXIF)
+        # Build description string for ImageDescription tag
         parts = []
         if tags:
             parts.append(f"Keywords: {tags}")
@@ -249,17 +247,42 @@ def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None,
             parts.append(f"Comment: {comment}")
         if raw_date:
             parts.append(f"Raw date: {raw_date}")
-        if parts:
-            tiff_tags[270] = " | ".join(parts)  # ImageDescription
         if gps:
-            # Store GPS as plain decimal strings in ImageDescription rather than
-            # attempting TIFF GPS IFD rational encoding, which Pillow does not
-            # support reliably via tag_v2. XMP sidecar is the robust path for GPS
-            # on TIFF; here we at least preserve the coordinates as readable text.
             lat, lon = gps
-            gps_str = f"GPS: {lat:.6f}, {lon:.6f}"
-            tiff_tags[270] = (tiff_tags.get(270, "") + " | " + gps_str).lstrip(" | ")
-        img.save(path, tiffinfo=tiff_tags)
+            parts.append(f"GPS: {lat:.6f}, {lon:.6f}")
+
+        # Load existing EXIF if present, otherwise start fresh
+        try:
+            exif_dict = piexif.load(path)
+        except Exception:
+            exif_dict = {}
+        for ifd in ('0th', 'Exif', 'GPS', '1st'):
+            if ifd not in exif_dict:
+                exif_dict[ifd] = {}
+
+        exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = date_str.encode('utf-8')
+        exif_dict['0th'][piexif.ImageIFD.DateTime] = date_str.encode('utf-8')
+        if parts:
+            exif_dict['0th'][piexif.ImageIFD.ImageDescription] = " | ".join(parts).encode('utf-8')
+        if raw_date:
+            exif_dict['Exif'][piexif.ExifIFD.UserComment] = piexif.helper.UserComment.dump(
+                f"Raw date: {raw_date}", encoding="unicode"
+            )
+        if gps:
+            lat, lon = gps
+            def to_dms(val):
+                d = int(abs(val))
+                m = int((abs(val) - d) * 60)
+                s = round(((abs(val) - d) * 60 - m) * 60 * 100)
+                return [(d, 1), (m, 1), (s, 100)]
+            exif_dict['GPS'][piexif.GPSIFD.GPSLatitudeRef] = b'N' if lat >= 0 else b'S'
+            exif_dict['GPS'][piexif.GPSIFD.GPSLatitude] = to_dms(lat)
+            exif_dict['GPS'][piexif.GPSIFD.GPSLongitudeRef] = b'E' if lon >= 0 else b'W'
+            exif_dict['GPS'][piexif.GPSIFD.GPSLongitude] = to_dms(lon)
+
+        exif_bytes = piexif.dump(exif_dict)
+        piexif.insert(exif_bytes, path)
+        _write_iptc_keywords(path, tags, comment)
         print(f"   💾 Success: {os.path.basename(path)} updated.")
     except Exception as e:
         print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
@@ -413,13 +436,26 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             next_file = files[i+1]
             next_path = os.path.join(folder, next_file)
 
+            # Verify the next file is readable before sending to VLM
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    _test = Image.open(next_path)
+                    _test.load()
+                    _test.close()
+                next_readable = True
+            except Exception:
+                next_readable = False
+                print(f"      Could not open {next_file} — skipping back check.")
+
             is_back_prompt = (
                 "Look very carefully at this image. Is it the BACK (reverse side) of a physical printed photograph? "
                 "The back would show: blank paper, handwriting, stamps, photo lab printing, or a plain surface. "
                 "If you see any photographic image content AT ALL, answer No. "
                 "Answer ONLY 'Yes' or 'No'."
             )
-            is_back_resp = ask_vlm(next_path, is_back_prompt)
+            is_back_resp = ask_vlm(next_path, is_back_prompt) if next_readable else ""  
             is_back = False
             if is_back_resp.strip().lower().startswith("yes"):
                 confirm_prompt = "Does this image show a photographic scene with people, places, or objects? Answer ONLY 'Yes' or 'No'."
