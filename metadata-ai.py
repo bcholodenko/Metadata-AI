@@ -236,10 +236,30 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
         print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
 
 def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
-    # TIFF files are written as XMP sidecar to avoid any risk of pixel corruption.
-    # In-place EXIF patching and Pillow re-saves both risk corrupting TIFF image data.
-    # XMP sidecars are read by Lightroom, Apple Photos, and most DAM tools.
+    # Write XMP sidecar first, then use ExifTool to merge it safely into the TIFF's
+    # EXIF without re-encoding any pixel data. If ExifTool is not available, the XMP
+    # sidecar is kept as a fallback.
+    import shutil, subprocess
+    xmp_path = os.path.splitext(path)[0] + ".xmp"
     _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
+
+    if shutil.which("exiftool") is None:
+        print(f"      ⚠️ ExifTool not found — XMP sidecar kept at {os.path.basename(xmp_path)}")
+        return
+
+    try:
+        result = subprocess.run(
+            ["exiftool", "-overwrite_original", f"-tagsfromfile={xmp_path}", path],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            os.remove(xmp_path)
+            print(f"   💾 Success: {os.path.basename(path)} updated via ExifTool.")
+        else:
+            print(f"      ⚠️ ExifTool merge failed — XMP sidecar kept. Error: {result.stderr.strip()}")
+    except Exception as e:
+        print(f"      ⚠️ ExifTool error — XMP sidecar kept: {e}")
+
 
 def _apply_metadata_png(path, date_str, tags=None, comment=None, raw_date=None):
     try:
