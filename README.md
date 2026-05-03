@@ -1,5 +1,4 @@
 <img width="600" alt="logo" src="https://github.com/user-attachments/assets/8bcf39fd-93c3-4017-96e0-7d692237b197" />
-
 Metadata-AI is a local AI-powered tool that automatically tags and dates scanned physical photographs by writing metadata directly into image files.
 
 It uses a vision language model (VLM) running locally via [LM Studio](https://lmstudio.ai) to analyze each photo, detect whether the next scanned image is the back of a photograph, extract handwritten dates and comments via OCR (translating to English if needed), and estimate dates from visual cues like fashion and technology when no written date is available.
@@ -108,7 +107,7 @@ If you scanned the backs of photos, place them immediately after the front in fi
 
 | Format | Metadata method |
 |---|---|
-| `.jpg`, `.jpeg` | piexif (EXIF date + GPS) + iptcinfo3 (IPTC keywords + caption) |
+| `.jpg`, `.jpeg` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
 | `.tiff`, `.tif` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted after merge) |
 | `.png` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
 | `.heic`, `.webp` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
