@@ -1,5 +1,7 @@
 <img width="600" alt="logo" src="https://github.com/user-attachments/assets/8bcf39fd-93c3-4017-96e0-7d692237b197" />
 
+# Metadata-AI
+
 Metadata-AI is a local AI-powered tool that automatically tags and dates scanned physical photographs by writing metadata directly into image files.
 
 It uses a vision language model (VLM) running locally via [LM Studio](https://lmstudio.ai) to analyze each photo, detect whether the next scanned image is the back of a photograph, extract handwritten dates and comments via OCR (translating to English if needed), and estimate dates from visual cues like fashion and technology when no written date is available.
@@ -15,7 +17,7 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 - Writes `DateTimeOriginal` into EXIF and keywords/captions into IPTC metadata
 - Optionally geotags photos by identifying locations from visual clues and resolving GPS coordinates via Nominatim
 - Low-confidence date estimates are skipped and logged to a `review.html` report for manual review
-- Supports `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.png`, `.heic`, `.webp`, and `.dng` files
+- Supports `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.png`, `.heic`, `.webp`, `.dng`, and raw formats (`.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`, `.raw`)
 - DNG files are written as `.xmp` sidecar files, compatible with Lightroom and Apple Photos
 - All images are converted to JPEG and downscaled to a maximum of 2048px on the long edge before being sent to LM Studio — keeping API calls fast while staying within LM Studio's JPEG/PNG/WebP support
 - Handles very large scanned photos (600–1200 DPI scans can exceed 100 MP) without crashing
@@ -31,6 +33,7 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 - Python 3.8+
 - [LM Studio](https://lmstudio.ai) running locally with a vision-capable model loaded
 - [ExifTool](https://exiftool.org) for writing metadata into all image formats (`brew install exiftool`)
+- [rawpy](https://letmaik.github.io/rawpy/) for opening raw camera formats (`pip install rawpy`)
 
 ---
 
@@ -115,6 +118,7 @@ If you scanned the backs of photos, place them immediately after the front in fi
 | `.png` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
 | `.heic`, `.webp` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
 | `.dng` | XMP sidecar file |
+| `.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`, `.raw` | Decoded via rawpy for VLM preview; XMP sidecar file |
 
 ---
 
