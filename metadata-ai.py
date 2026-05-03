@@ -180,10 +180,8 @@ def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=N
         _apply_metadata_jpeg(path, date_str, tags, comment, raw_date, gps)
     elif ext in ('.tiff', '.tif'):
         _apply_metadata_tiff(path, date_str, tags, comment, raw_date, gps)
-    elif ext in ('.heic', '.webp'):
-        _apply_metadata_png(path, date_str, tags, comment, raw_date)
-    elif ext == '.png':
-        _apply_metadata_png(path, date_str, tags, comment, raw_date)
+    elif ext in ('.png', '.heic', '.webp'):
+        _apply_metadata_png(path, date_str, tags, comment, raw_date, gps)
     else:
         print(f"   ⚠️ Unsupported format for metadata writing: {ext}")
 
@@ -261,22 +259,28 @@ def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None,
         print(f"      ⚠️ ExifTool error — XMP sidecar kept: {e}")
 
 
-def _apply_metadata_png(path, date_str, tags=None, comment=None, raw_date=None):
+def _apply_metadata_png(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
+    # Same XMP+ExifTool approach as TIFF — avoids re-encoding pixel data.
+    import shutil, subprocess
+    xmp_path = os.path.splitext(path)[0] + ".xmp"
+    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
+
+    if shutil.which("exiftool") is None:
+        print(f"      ⚠️ ExifTool not found — XMP sidecar kept at {os.path.basename(xmp_path)}")
+        return
+
     try:
-        from PIL import PngImagePlugin
-        img = Image.open(path)
-        info = PngImagePlugin.PngInfo()
-        info.add_text("DateTimeOriginal", date_str)
-        if tags:
-            info.add_text("Keywords", tags)
-        if comment:
-            info.add_text("Description", comment)
-        if raw_date:
-            info.add_text("RawDate", raw_date)
-        img.save(path, pnginfo=info)
-        print(f"   💾 Success: {os.path.basename(path)} updated.")
+        result = subprocess.run(
+            ["exiftool", "-overwrite_original", f"-tagsfromfile={xmp_path}", path],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            os.remove(xmp_path)
+            print(f"   💾 Success: {os.path.basename(path)} updated via ExifTool.")
+        else:
+            print(f"      ⚠️ ExifTool merge failed — XMP sidecar kept. Error: {result.stderr.strip()}")
     except Exception as e:
-        print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
+        print(f"      ⚠️ ExifTool error — XMP sidecar kept: {e}")
 
 def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
     try:
