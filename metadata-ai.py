@@ -527,14 +527,14 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
 
         date_instruction = (
             "Analyze the fashion, hairstyles, technology, and setting in this photo. "
-            f"The folder containing this photo is named '{folder_name}' — use this as a hint for the date and location if relevant. "
+            f"The folder containing this photo is named '{folder_name}' — treat this as high-confidence information for the date and location. "
             "Estimate the date as specifically as possible — could be YYYY:MM, YYYY, a decade like '1970s', or 'circa 1965'. "
             f"The date must be before {cutoff_year}. "
             "Also provide a confidence score from 1-10 for your date estimate.\n"
             "DATE: <your estimate>\n"
             "CONFIDENCE: <score>\n"
         ) if not found_date else (
-            f"The folder containing this photo is named '{folder_name}' — use this as a hint for the location if relevant.\n"
+            f"The folder containing this photo is named '{folder_name}' — treat this as high-confidence information for the location.\n"
         )
 
         full_prompt = (
@@ -549,6 +549,8 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         )
 
         resp = ask_vlm(current_path, full_prompt)
+        if not resp:
+            print(f"      ⚠️ VLM returned no response — skipping analysis.")
 
         # Parse all fields from the single response
         date_line    = re.search(r'DATE:\s*([^\n]+)',       resp)
@@ -565,16 +567,30 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             confidence = int(conf_line.group(1)) if conf_line else 5
             found_date, raw_date_text = parse_fuzzy_date(raw_guess)
             if found_date:
-                print(f"      Date:       {found_date} (confidence: {confidence}/10)" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
+                # Validate month and day are in range
+                parts = found_date.split(':')
+                try:
+                    if not (1 <= int(parts[1]) <= 12 and 1 <= int(parts[2].split()[0]) <= 31):
+                        print(f"      Invalid date from VLM ('{raw_guess}') — discarding.")
+                        found_date = None
+                    else:
+                        print(f"      Date:       {found_date} (confidence: {confidence}/10)" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
+                except (IndexError, ValueError):
+                    print(f"      Invalid date format ('{raw_guess}') — discarding.")
+                    found_date = None
             else:
                 print(f"      VLM could not determine a date. Raw response: '{raw_guess}' (confidence: {confidence}/10)")
 
-        raw_time    = time_line.group(1).strip()             if time_line    else None
-        vlm_scene   = scene_line.group(1).strip()            if scene_line   else None
-        vlm_setting = setting_line.group(1).strip()          if setting_line else None
-        vlm_flash   = flash_line.group(1).strip().lower()    if flash_line   else None
-        tags_resp   = keywords_line.group(1).strip()         if keywords_line else None
-        geo_resp_inline = geo_line.group(1).strip()          if geo_line     else None
+        def clean(s):
+            """Strip markdown formatting characters from VLM field values."""
+            return re.sub(r'[*_`#]', '', s).strip() if s else s
+
+        raw_time    = clean(time_line.group(1))         if time_line    else None
+        vlm_scene   = clean(scene_line.group(1))        if scene_line   else None
+        vlm_setting = clean(setting_line.group(1))      if setting_line else None
+        vlm_flash   = clean(flash_line.group(1)).lower() if flash_line   else None
+        tags_resp   = clean(keywords_line.group(1))     if keywords_line else None
+        geo_resp_inline = clean(geo_line.group(1))      if geo_line     else None
 
         if raw_time:    print(f"      Time:       {raw_time}")
         if vlm_scene:   print(f"      Scene:      {vlm_scene}")
@@ -618,7 +634,7 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             print(f"   5) No keywords returned by VLM.")
 
         # Step 6: Write metadata
-        print(f"   6) 💾 Writing metadata...")
+        print(f"   6) Writing metadata...")
         if found_date:
             try:
                 year = int(found_date[:4])
@@ -643,6 +659,22 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             print(f"      ❌ No date found — skipping.")
 
     write_review_report(folder, review_queue)
+
+    # Summary
+    total = len(files)
+    skipped = len(processed_files)  # back-of-photo files consumed
+    reviewed = len(review_queue)
+    written = total - skipped - reviewed - sum(
+        1 for f in files if f not in processed_files
+        and not any(r['file'] == f for r in review_queue)
+    )
+    print(f"\n{'─'*50}")
+    print(f"   📊 Folder summary: {total} files scanned")
+    if skipped:
+        print(f"      {skipped} back-of-photo file(s) consumed")
+    if reviewed:
+        print(f"      {reviewed} low-confidence file(s) added to review queue")
+    print(f"{'─'*50}")
 
 
 def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False, recursive=False):
