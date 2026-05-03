@@ -186,52 +186,28 @@ def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=N
         print(f"   ⚠️ Unsupported format for metadata writing: {ext}")
 
 def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
+    # XMP+ExifTool approach for consistency and to avoid the two-pass
+    # iptcinfo3+piexif corruption risk.
+    import shutil, subprocess
+    xmp_path = os.path.splitext(path)[0] + ".xmp"
+    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
+
+    if shutil.which("exiftool") is None:
+        print(f"      ⚠️ ExifTool not found — XMP sidecar kept at {os.path.basename(xmp_path)}")
+        return
+
     try:
-        # Step A: write IPTC keywords/caption first via iptcinfo3.
-        # Must happen before piexif so that piexif.insert() writes EXIF cleanly on top.
-        _write_iptc_keywords(path, tags, comment)
-
-        # Step B: load EXIF (after iptcinfo3 has saved), then write date + GPS.
-        # If existing EXIF is corrupt (e.g. from a previous double-write), start fresh.
-        try:
-            exif_dict = piexif.load(path)
-        except Exception:
-            exif_dict = {}
-        if 'Exif' not in exif_dict:
-            exif_dict['Exif'] = {}
-        if '0th' not in exif_dict:
-            exif_dict['0th'] = {}
-        if 'GPS' not in exif_dict:
-            exif_dict['GPS'] = {}
-        if '1st' not in exif_dict:
-            exif_dict['1st'] = {}
-
-        exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = date_str.encode('utf-8')
-
-        if raw_date:
-            exif_dict['Exif'][piexif.ExifIFD.UserComment] = piexif.helper.UserComment.dump(
-                f"Raw date: {raw_date}", encoding="unicode"
-            )
-
-        if gps:
-            if 'GPS' not in exif_dict:
-                exif_dict['GPS'] = {}
-            lat, lon = gps
-            def to_dms(val):
-                d = int(abs(val))
-                m = int((abs(val) - d) * 60)
-                s = round(((abs(val) - d) * 60 - m) * 60 * 100)
-                return [(d, 1), (m, 1), (s, 100)]
-            exif_dict['GPS'][piexif.GPSIFD.GPSLatitudeRef] = b'N' if lat >= 0 else b'S'
-            exif_dict['GPS'][piexif.GPSIFD.GPSLatitude] = to_dms(lat)
-            exif_dict['GPS'][piexif.GPSIFD.GPSLongitudeRef] = b'E' if lon >= 0 else b'W'
-            exif_dict['GPS'][piexif.GPSIFD.GPSLongitude] = to_dms(lon)
-
-        exif_bytes = piexif.dump(exif_dict)
-        piexif.insert(exif_bytes, path)
-        print(f"   💾 Success: {os.path.basename(path)} updated.")
+        result = subprocess.run(
+            ["exiftool", "-overwrite_original", f"-tagsfromfile={xmp_path}", path],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            os.remove(xmp_path)
+            print(f"   💾 Success: {os.path.basename(path)} updated via ExifTool.")
+        else:
+            print(f"      ⚠️ ExifTool merge failed — XMP sidecar kept. Error: {result.stderr.strip()}")
     except Exception as e:
-        print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
+        print(f"      ⚠️ ExifTool error — XMP sidecar kept: {e}")
 
 def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
     # Write XMP sidecar first, then use ExifTool to merge it safely into the TIFF's
