@@ -352,6 +352,45 @@ def geolocate(location_text):
 # ---------------------------------------------------------------------------
 # Main archival loop
 # ---------------------------------------------------------------------------
+def _parse_time_of_day(text):
+    """Converts a natural language time estimate to an hour (0-23). Returns 12 if unparseable."""
+    text = text.lower().strip()
+    # Specific time like "3pm", "10am", "14:00"
+    m = re.search(r'(\d{1,2})(?::(\d{2}))\s*(am|pm)?', text)
+    if m:
+        hour = int(m.group(1))
+        ampm = m.group(3)
+        if ampm == 'pm' and hour != 12:
+            hour += 12
+        elif ampm == 'am' and hour == 12:
+            hour = 0
+        return min(hour, 23)
+    m = re.search(r'(\d{1,2})\s*(am|pm)', text)
+    if m:
+        hour = int(m.group(1))
+        ampm = m.group(2)
+        if ampm == 'pm' and hour != 12:
+            hour += 12
+        elif ampm == 'am' and hour == 12:
+            hour = 0
+        return min(hour, 23)
+    # Natural language
+    if any(w in text for w in ['dawn', 'sunrise', 'early morning']):
+        return 6
+    if 'morning' in text:
+        return 9
+    if any(w in text for w in ['midday', 'noon', 'lunch']):
+        return 12
+    if 'afternoon' in text:
+        return 14
+    if any(w in text for w in ['late afternoon', 'golden hour']):
+        return 17
+    if any(w in text for w in ['sunset', 'dusk', 'evening']):
+        return 19
+    if 'night' in text:
+        return 21
+    return 12  # default noon
+
 def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo):
     processed_files = set()
     review_queue = []
@@ -487,20 +526,35 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 f"{folder_context}"
                 "Estimate the date as specifically as possible — could be YYYY:MM, YYYY, a decade like '1970s', or 'circa 1965'. "
                 f"The date must be before {cutoff_year}. "
+                "Also estimate the time of day based on lighting, shadows, and context — e.g. 'morning', 'midday', 'afternoon', 'evening', or a specific time like '3pm'. "
                 "Also provide a confidence score from 1-10 for your estimate. "
-                "Reply in this exact format:\nDATE: <your estimate>\nCONFIDENCE: <score>"
+                "Reply in this exact format:\nDATE: <your estimate>\nTIME: <your estimate>\nCONFIDENCE: <score>"
             )
             resp = ask_vlm(current_path, guess_prompt)
 
             date_line = re.search(r'DATE:\s*(.+)', resp)
+            time_line = re.search(r'TIME:\s*(.+)', resp)
             conf_line = re.search(r'CONFIDENCE:\s*(\d+)', resp)
 
             raw_guess = date_line.group(1).strip() if date_line else resp.strip()
+            raw_time = time_line.group(1).strip() if time_line else None
             confidence = int(conf_line.group(1)) if conf_line else 5
 
             found_date, raw_date_text = parse_fuzzy_date(raw_guess)
+
+            # Parse time estimate into an hour for the EXIF timestamp
+            if raw_time:
+                time_hour = _parse_time_of_day(raw_time)
+            else:
+                time_hour = 12  # default noon
+
+            # Replace the placeholder hour in found_date with the estimated hour
+            if found_date and time_hour is not None:
+                found_date = found_date[:11] + f"{time_hour:02d}:00:00"
+
             if found_date:
-                print(f"      VLM guessed date: {found_date} (confidence: {confidence}/10)" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
+                time_str = f" (~{raw_time})" if raw_time else ""
+                print(f"      VLM guessed date: {found_date} (confidence: {confidence}/10){time_str}" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
             else:
                 print(f"      VLM could not determine a date. Raw response: '{raw_guess}' (confidence: {confidence}/10)")
 
