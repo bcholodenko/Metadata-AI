@@ -99,9 +99,10 @@ If you scanned the backs of photos, place them immediately after the front in fi
 
 1. **Back detection** — For each photo, the script checks if the next image is the reverse side of a physical print using a two-step VLM confirmation. If confirmed, it attempts to OCR a date and any handwritten comments from the back. Comments are translated to English if needed. If no date is found on the back, the script falls through to step 2.
 2. **Folder name and IPTC keyword check** — Parses the folder name for a date (e.g. `7-3-87` → July 3, 1987) and a location hint (e.g. `Hawaii`). If no folder date is found, checks existing IPTC keywords for a parseable date (e.g. "Sep 1960" or "circa 1975").
-3. **AI visual estimation** — If still no date, the VLM analyzes fashion, technology, and other visual cues to estimate the year and month, along with a time of day (inferred from lighting, shadows, and context) and a confidence score. Any folder date or location hint is passed as context to improve accuracy. The estimated time is written into the `DateTimeOriginal` EXIF timestamp.
+3. **AI visual estimation** — If a date was found, asks the VLM to estimate the time of day from lighting and shadows. If no date was found, asks the VLM to estimate both date and time of day, along with a confidence score. Any folder date or location hint is passed as context to improve accuracy. The estimated time is written into the `DateTimeOriginal` EXIF timestamp.
 4. **Geotagging** — If enabled, the VLM looks for identifiable location clues in the image. If none are found, falls back to any location hint extracted from the folder name. Locations are resolved to GPS coordinates via Nominatim.
-5. **Metadata writing** — Valid dates before the cutoff year are written into the file along with AI-generated keyword tags and any comments extracted from the back. Low-confidence estimates are added to a `review.html` report instead of being written. DNG files receive a `.xmp` sidecar instead of direct EXIF modification.
+5. **Keyword generation** — The VLM generates 5 descriptive keywords for the photo, which are written into the file's metadata.
+6. **Metadata writing** — Valid dates before the cutoff year are written into the file along with the generated keywords and any comments extracted from the back. Low-confidence estimates are added to a `review.html` report instead of being written. DNG files receive a `.xmp` sidecar instead of direct EXIF modification.
 
 ---
 
