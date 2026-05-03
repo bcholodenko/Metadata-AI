@@ -55,6 +55,16 @@ def parse_fuzzy_date(text):
     m = re.search(r'(\d{4})[:/-](\d{2})', text)
     if m:
         return f"{m.group(1)}:{m.group(2)}:01 12:00:00", None
+    # M-D-YY or M-D-YYYY folder name patterns e.g. "7-3-87" or "8-26 to 8-30-87 Hawaii"
+    m = re.search(r'\b(\d{1,2})[-/](\d{1,2})[-/](\d{2})\b', text)
+    if m:
+        month, day, year = m.group(1), m.group(2), m.group(3)
+        full_year = f"19{year}" if int(year) > 20 else f"20{year}"
+        return f"{full_year}:{int(month):02d}:{int(day):02d} 12:00:00", None
+    m = re.search(r'\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b', text)
+    if m:
+        month, day, year = m.group(1), m.group(2), m.group(3)
+        return f"{year}:{int(month):02d}:{int(day):02d} 12:00:00", None
     # Bare 4-digit year
     m = re.search(r'\b(\d{4})\b', text)
     if m:
@@ -346,6 +356,15 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
     processed_files = set()
     review_queue = []
 
+    # Extract date and location hint from folder name
+    folder_name = os.path.basename(folder)
+    folder_date, folder_date_raw = parse_fuzzy_date(folder_name)
+    # Simple location hint: words after stripping date-like tokens
+    folder_location = re.sub(r'[\d]{1,4}[-/ to]+[\d]{1,4}(?:[-/ to]+[\d]{1,4})?', '', folder_name).strip(' -_')
+    folder_location = folder_location if len(folder_location) > 2 else None
+    if folder_date:
+        print(f"   📁 Folder date hint: {folder_date}" + (f" — location hint: {folder_location}" if folder_location else ""))
+
     print(f"Starting archival of {len(files)} photos in {folder}...")
 
     for i in range(len(files)):
@@ -434,26 +453,38 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         else:
             print(f"      No next image to check.")
 
-        # Step 2: Check IPTC keywords for a date (e.g. "Sep 1960", "Summer 1972")
+        # Step 2: Check folder name then IPTC keywords for a date
         if not found_date:
-            print(f"   2) Checking IPTC keywords for date...")
-            _, _, iptc_keywords = get_iptc_metadata(current_path)
-            if iptc_keywords:
-                for keyword in iptc_keywords:
-                    found_date, raw_date_text = parse_fuzzy_date(keyword)
-                    if found_date:
-                        print(f"      Date parsed from IPTC keyword '{keyword}': {found_date}" + (f" (fuzzy: {raw_date_text})" if raw_date_text else ""))
-                        break
-                if not found_date:
-                    print(f"      No date found in IPTC keywords.")
+            print(f"   2) Checking folder name and IPTC keywords for date...")
+            if folder_date:
+                found_date = folder_date
+                raw_date_text = folder_date_raw
+                confidence = 10
+                print(f"      Date from folder name '{folder_name}': {found_date}")
             else:
-                print(f"      No IPTC keywords found.")
+                _, _, iptc_keywords = get_iptc_metadata(current_path)
+                if iptc_keywords:
+                    for keyword in iptc_keywords:
+                        found_date, raw_date_text = parse_fuzzy_date(keyword)
+                        if found_date:
+                            print(f"      Date parsed from IPTC keyword '{keyword}': {found_date}" + (f" (fuzzy: {raw_date_text})" if raw_date_text else ""))
+                            break
+                    if not found_date:
+                        print(f"      No date found in IPTC keywords.")
+                else:
+                    print(f"      No IPTC keywords found.")
 
         # Step 3: VLM visual date guess with confidence score
         if not found_date:
             print(f"   3) Asking VLM to guess date from image content...")
+            folder_context = ""
+            if folder_date:
+                folder_context += f"The folder containing this photo is named '{folder_name}', suggesting the date is around {folder_date[:4]}. "
+            if folder_location:
+                folder_context += f"The folder name also suggests the location may be '{folder_location}'. "
             guess_prompt = (
                 "Analyze the fashion, hairstyles, technology, and setting in this photo. "
+                f"{folder_context}"
                 "Estimate the date as specifically as possible — could be YYYY:MM, YYYY, a decade like '1970s', or 'circa 1965'. "
                 f"The date must be before {cutoff_year}. "
                 "Also provide a confidence score from 1-10 for your estimate. "
@@ -499,7 +530,16 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                     print(f"      Could not resolve GPS — storing as text tag.")
                     found_comment = (found_comment + f" | Location: {geo_resp}") if found_comment else f"Location: {geo_resp}"
             else:
-                print(f"      No location identified.")
+                if folder_location and not gps_coords:
+                    print(f"      No location from image — trying folder name hint: '{folder_location}'")
+                    gps_coords = geolocate(folder_location)
+                    if gps_coords:
+                        print(f"      GPS from folder name: {gps_coords[0]:.4f}, {gps_coords[1]:.4f}")
+                        found_comment = (found_comment + f" | Location: {folder_location}") if found_comment else f"Location: {folder_location}"
+                    else:
+                        print(f"      No location identified.")
+                else:
+                    print(f"      No location identified.")
 
         # Step 5: Write metadata
         print(f"   5) 💾 Writing metadata...")
