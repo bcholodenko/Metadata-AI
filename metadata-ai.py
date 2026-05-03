@@ -178,8 +178,10 @@ def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=N
         _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
     elif ext in ('.jpg', '.jpeg'):
         _apply_metadata_jpeg(path, date_str, tags, comment, raw_date, gps)
-    elif ext in ('.tiff', '.tif', '.heic', '.webp'):
+    elif ext in ('.tiff', '.tif'):
         _apply_metadata_tiff(path, date_str, tags, comment, raw_date, gps)
+    elif ext in ('.heic', '.webp'):
+        _apply_metadata_png(path, date_str, tags, comment, raw_date)
     elif ext == '.png':
         _apply_metadata_png(path, date_str, tags, comment, raw_date)
     else:
@@ -234,58 +236,10 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
         print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
 
 def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
-    # Use piexif to write directly into the TIFF's EXIF block without re-encoding
-    # any image data. Pillow's img.save() re-encodes pixels and corrupts some TIFFs
-    # (black regions, color shifts). piexif.insert() patches only the metadata bytes.
-    import warnings
-    try:
-        # Build description string for ImageDescription tag
-        parts = []
-        if tags:
-            parts.append(f"Keywords: {tags}")
-        if comment:
-            parts.append(f"Comment: {comment}")
-        if raw_date:
-            parts.append(f"Raw date: {raw_date}")
-        if gps:
-            lat, lon = gps
-            parts.append(f"GPS: {lat:.6f}, {lon:.6f}")
-
-        # Load existing EXIF if present, otherwise start fresh
-        try:
-            exif_dict = piexif.load(path)
-        except Exception:
-            exif_dict = {}
-        for ifd in ('0th', 'Exif', 'GPS', '1st'):
-            if ifd not in exif_dict:
-                exif_dict[ifd] = {}
-
-        exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = date_str.encode('utf-8')
-        exif_dict['0th'][piexif.ImageIFD.DateTime] = date_str.encode('utf-8')
-        if parts:
-            exif_dict['0th'][piexif.ImageIFD.ImageDescription] = " | ".join(parts).encode('utf-8')
-        if raw_date:
-            exif_dict['Exif'][piexif.ExifIFD.UserComment] = piexif.helper.UserComment.dump(
-                f"Raw date: {raw_date}", encoding="unicode"
-            )
-        if gps:
-            lat, lon = gps
-            def to_dms(val):
-                d = int(abs(val))
-                m = int((abs(val) - d) * 60)
-                s = round(((abs(val) - d) * 60 - m) * 60 * 100)
-                return [(d, 1), (m, 1), (s, 100)]
-            exif_dict['GPS'][piexif.GPSIFD.GPSLatitudeRef] = b'N' if lat >= 0 else b'S'
-            exif_dict['GPS'][piexif.GPSIFD.GPSLatitude] = to_dms(lat)
-            exif_dict['GPS'][piexif.GPSIFD.GPSLongitudeRef] = b'E' if lon >= 0 else b'W'
-            exif_dict['GPS'][piexif.GPSIFD.GPSLongitude] = to_dms(lon)
-
-        exif_bytes = piexif.dump(exif_dict)
-        piexif.insert(exif_bytes, path)
-        _write_iptc_keywords(path, tags, comment)
-        print(f"   💾 Success: {os.path.basename(path)} updated.")
-    except Exception as e:
-        print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
+    # TIFF files are written as XMP sidecar to avoid any risk of pixel corruption.
+    # In-place EXIF patching and Pillow re-saves both risk corrupting TIFF image data.
+    # XMP sidecars are read by Lightroom, Apple Photos, and most DAM tools.
+    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps)
 
 def _apply_metadata_png(path, date_str, tags=None, comment=None, raw_date=None):
     try:
