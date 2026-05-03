@@ -58,16 +58,6 @@ def parse_fuzzy_date(text):
     m = re.search(r'(\d{4})[:/-](\d{2})', text)
     if m:
         return f"{m.group(1)}:{m.group(2)}:01 12:00:00", None
-    # M-D-YY or M-D-YYYY folder name patterns e.g. "7-3-87" or "8-26 to 8-30-87 Hawaii"
-    m = re.search(r'\b(\d{1,2})[-/](\d{1,2})[-/](\d{2})\b', text)
-    if m:
-        month, day, year = m.group(1), m.group(2), m.group(3)
-        full_year = f"19{year}" if int(year) > 20 else f"20{year}"
-        return f"{full_year}:{int(month):02d}:{int(day):02d} 12:00:00", None
-    m = re.search(r'\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b', text)
-    if m:
-        month, day, year = m.group(1), m.group(2), m.group(3)
-        return f"{year}:{int(month):02d}:{int(day):02d} 12:00:00", None
     # Bare 4-digit year
     m = re.search(r'\b(\d{4})\b', text)
     if m:
@@ -165,20 +155,20 @@ def run_tesseract(image_path):
 # ---------------------------------------------------------------------------
 # Metadata writers
 # ---------------------------------------------------------------------------
-def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=None, xmp_only=False):
+def apply_metadata(path, date_str, tags=None, comment=None, raw_date=None, gps=None, xmp_only=False, scene=None, setting=None, flash=None):
     ext = os.path.splitext(path)[1].lower()
     if xmp_only or ext == '.dng':
         _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
     elif ext in ('.jpg', '.jpeg'):
-        _apply_metadata_jpeg(path, date_str, tags, comment, raw_date, gps)
+        _apply_metadata_jpeg(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
     elif ext in ('.tiff', '.tif'):
-        _apply_metadata_tiff(path, date_str, tags, comment, raw_date, gps)
+        _apply_metadata_tiff(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
     elif ext in ('.png', '.heic', '.webp'):
         _apply_metadata_png(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
     else:
         print(f"   ⚠️ Unsupported format for metadata writing: {ext}")
 
-def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None, gps=None):
+def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None, gps=None, scene=None, setting=None, flash=None):
     # XMP+ExifTool approach for consistency and to avoid any
     import shutil, subprocess
     xmp_path = os.path.splitext(path)[0] + ".xmp"
@@ -195,7 +185,7 @@ def _apply_metadata_jpeg(path, date_str, tags=None, comment=None, raw_date=None,
         )
         if result.returncode == 0:
             os.remove(xmp_path)
-            print(f"   💾 Success: {os.path.basename(path)} updated via ExifTool.")
+            print(f"   ✅ Success: {os.path.basename(path)} updated via ExifTool.")
         else:
             print(f"      ⚠️ ExifTool merge failed — XMP sidecar kept. Error: {result.stderr.strip()}")
     except Exception as e:
@@ -220,7 +210,7 @@ def _apply_metadata_tiff(path, date_str, tags=None, comment=None, raw_date=None,
         )
         if result.returncode == 0:
             os.remove(xmp_path)
-            print(f"   💾 Success: {os.path.basename(path)} updated via ExifTool.")
+            print(f"   ✅ Success: {os.path.basename(path)} updated via ExifTool.")
         else:
             print(f"      ⚠️ ExifTool merge failed — XMP sidecar kept. Error: {result.stderr.strip()}")
     except Exception as e:
@@ -244,7 +234,7 @@ def _apply_metadata_png(path, date_str, tags=None, comment=None, raw_date=None, 
         )
         if result.returncode == 0:
             os.remove(xmp_path)
-            print(f"   💾 Success: {os.path.basename(path)} updated via ExifTool.")
+            print(f"   ✅ Success: {os.path.basename(path)} updated via ExifTool.")
         else:
             print(f"      ⚠️ ExifTool merge failed — XMP sidecar kept. Error: {result.stderr.strip()}")
     except Exception as e:
@@ -287,7 +277,7 @@ def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, 
 <?xpacket end='w'?>"""
         with open(xmp_path, "w", encoding="utf-8") as f:
             f.write(xmp_content)
-        print(f"   💾 Success: {os.path.basename(xmp_path)} written.")
+        print(f"   ✅ Success: {os.path.basename(xmp_path)} written.")
     except Exception as e:
         print(f"   💾 Metadata Error for {os.path.basename(path)}: {e}")
 
@@ -398,14 +388,9 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
     processed_files = set()
     review_queue = []
 
-    # Extract date and location hint from folder name
+    # Pass folder name directly to VLM as context
     folder_name = os.path.basename(folder)
-    folder_date, folder_date_raw = parse_fuzzy_date(folder_name)
-    # Simple location hint: words after stripping date-like tokens
-    folder_location = re.sub(r'[\d]{1,4}[-/ to]+[\d]{1,4}(?:[-/ to]+[\d]{1,4})?', '', folder_name).strip(' -_')
-    folder_location = folder_location if len(folder_location) > 2 else None
-    if folder_date:
-        print(f"   📁 Folder date hint: {folder_date}" + (f" — location hint: {folder_location}" if folder_location else ""))
+    print(f"   📁 Folder: {folder_name}")
 
     print(f"Starting archival of {len(files)} photos in {folder}...")
 
@@ -495,26 +480,20 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         else:
             print(f"      No next image to check.")
 
-        # Step 2: Check folder name then IPTC keywords for a date
+        # Step 2: Check IPTC keywords for a date
         if not found_date:
-            print(f"   2) Checking folder name and IPTC keywords for date...")
-            if folder_date:
-                found_date = folder_date
-                raw_date_text = folder_date_raw
-                confidence = 10
-                print(f"      Date from folder name '{folder_name}': {found_date}")
+            print(f"   2) Checking IPTC keywords for date...")
+            _, _, iptc_keywords = get_iptc_metadata(current_path)
+            if iptc_keywords:
+                for keyword in iptc_keywords:
+                    found_date, raw_date_text = parse_fuzzy_date(keyword)
+                    if found_date:
+                        print(f"      Date parsed from IPTC keyword '{keyword}': {found_date}" + (f" (fuzzy: {raw_date_text})" if raw_date_text else ""))
+                        break
+                if not found_date:
+                    print(f"      No date found in IPTC keywords.")
             else:
-                _, _, iptc_keywords = get_iptc_metadata(current_path)
-                if iptc_keywords:
-                    for keyword in iptc_keywords:
-                        found_date, raw_date_text = parse_fuzzy_date(keyword)
-                        if found_date:
-                            print(f"      Date parsed from IPTC keyword '{keyword}': {found_date}" + (f" (fuzzy: {raw_date_text})" if raw_date_text else ""))
-                            break
-                    if not found_date:
-                        print(f"      No date found in IPTC keywords.")
-                else:
-                    print(f"      No IPTC keywords found.")
+                print(f"      No IPTC keywords found.")
 
         # Step 3: Single VLM call — date (if unknown), time, scene, setting, flash,
         # location (if geotagging enabled), and keywords. Combining into one prompt
@@ -528,25 +507,21 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
 
         print(f"   3) Asking VLM to analyze image...")
 
-        folder_context = ""
-        if folder_date:
-            folder_context += f"The folder containing this photo is named '{folder_name}', suggesting the date is around {folder_date[:4]}. "
-        if folder_location:
-            folder_context += f"The folder name also suggests the location may be '{folder_location}'. "
-
         geo_instruction = (
             "LOCATION: <specific city, region, or landmark if clearly identifiable — otherwise 'none'>\n"
         ) if enable_geo else ""
 
         date_instruction = (
             "Analyze the fashion, hairstyles, technology, and setting in this photo. "
-            f"{folder_context}"
+            f"The folder containing this photo is named '{folder_name}' — use this as a hint for the date and location if relevant. "
             "Estimate the date as specifically as possible — could be YYYY:MM, YYYY, a decade like '1970s', or 'circa 1965'. "
             f"The date must be before {cutoff_year}. "
             "Also provide a confidence score from 1-10 for your date estimate.\n"
             "DATE: <your estimate>\n"
             "CONFIDENCE: <score>\n"
-        ) if not found_date else ""
+        ) if not found_date else (
+            f"The folder containing this photo is named '{folder_name}' — use this as a hint for the location if relevant.\n"
+        )
 
         full_prompt = (
             f"{date_instruction}"
@@ -562,14 +537,14 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         resp = ask_vlm(current_path, full_prompt)
 
         # Parse all fields from the single response
-        date_line    = re.search(r'DATE:\s*(.+)',       resp)
-        conf_line    = re.search(r'CONFIDENCE:\s*(\d+)', resp)
-        time_line    = re.search(r'TIME:\s*(.+)',       resp)
-        scene_line   = re.search(r'SCENE:\s*(.+)',      resp)
-        setting_line = re.search(r'SETTING:\s*(.+)',    resp)
-        flash_line   = re.search(r'FLASH:\s*(.+)',      resp)
-        geo_line     = re.search(r'LOCATION:\s*(.+)',   resp) if enable_geo else None
-        keywords_line = re.search(r'KEYWORDS:\s*(.+)',  resp)
+        date_line    = re.search(r'DATE:\s*([^\n]+)',       resp)
+        conf_line    = re.search(r'CONFIDENCE:\s*(\d+)',    resp)
+        time_line    = re.search(r'TIME:\s*([^\n]+)',       resp)
+        scene_line   = re.search(r'SCENE:\s*([^\n]+)',      resp)
+        setting_line = re.search(r'SETTING:\s*([^\n]+)',    resp)
+        flash_line   = re.search(r'FLASH:\s*([^\n]+)',      resp)
+        geo_line     = re.search(r'LOCATION:\s*([^\n]+)',   resp) if enable_geo else None
+        keywords_line = re.search(r'KEYWORDS:\s*([^\n]+)',  resp)
 
         if not found_date and date_line:
             raw_guess = date_line.group(1).strip()
@@ -597,8 +572,7 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         time_hour = _parse_time_of_day(raw_time) if raw_time else 12
         if found_date:
             found_date = found_date[:11] + f"{time_hour:02d}:00:00"
-            if raw_time:
-                print(f"      Timestamp:  {found_date} (~{raw_time})")
+            print(f"      Timestamp:  {found_date}" + (f" (~{raw_time})" if raw_time else ""))
 
         # Step 4: Geotagging — use inline location from VLM if available, else folder hint
         if enable_geo:
@@ -621,16 +595,7 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                     print(f"      Could not resolve GPS — storing as text tag.")
                     found_comment = (found_comment + f" | Location: {geo_resp}") if found_comment else f"Location: {geo_resp}"
             else:
-                if folder_location and not gps_coords:
-                    print(f"      No location from image — trying folder name hint: '{folder_location}'")
-                    gps_coords = geolocate(folder_location)
-                    if gps_coords:
-                        print(f"      GPS from folder name: {gps_coords[0]:.4f}, {gps_coords[1]:.4f}")
-                        found_comment = (found_comment + f" | Location: {folder_location}") if found_comment else f"Location: {folder_location}"
-                    else:
-                        print(f"      No location identified.")
-                else:
-                    print(f"      No location identified.")
+                print(f"      No location identified.")
 
         # Step 5: Keywords already generated in step 3 — just confirm or skip
         if tags_resp:
@@ -646,7 +611,8 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 if year < cutoff_year:
                     if confidence >= confidence_threshold:
                         apply_metadata(current_path, found_date, tags=tags_resp, comment=found_comment,
-                                       raw_date=raw_date_text, gps=gps_coords, xmp_only=xmp_only)
+                                       raw_date=raw_date_text, gps=gps_coords, xmp_only=xmp_only,
+                                       scene=vlm_scene, setting=vlm_setting, flash=vlm_flash)
                     else:
                         print(f"      ⚠️  Low confidence ({confidence}/10) — added to review queue.")
                         review_queue.append({
@@ -657,8 +623,8 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                         })
                 else:
                     print(f"      ⏭️  Skipping: date {year} is {cutoff_year} or later.")
-            except:
-                pass
+            except Exception as e:
+                print(f"      ❌ Write error: {e}")
         else:
             print(f"      ❌ No date found — skipping.")
 
