@@ -74,7 +74,7 @@ The cutoff year and other options are set interactively at runtime.
 
 ## Usage
 
-Run the script — you will be prompted for the photos directory and processing options:
+Run fully interactively — you will be prompted for all options:
 
 ```bash
 python metadata-ai.py
@@ -91,11 +91,30 @@ Recursively process subfolders? [y/N]: y
 Average dates in each folder using consensus year? [y/N]: y
 ```
 
-Or pass the directory as a command line argument:
+Or use CLI arguments to skip the prompts — any omitted flags will still be prompted:
 
 ```bash
+# Fully non-interactive
+python metadata-ai.py /path/to/photos --cutoff 1995 --confidence 7 -r --geotag --consensus
+
+# Mix of CLI and interactive — directory provided, rest prompted
 python metadata-ai.py /path/to/photos
+
+# XMP sidecar only, recursive
+python metadata-ai.py /path/to/photos -r --xmp-only
 ```
+
+All available flags:
+
+| Flag | Description | Default |
+|---|---|---|
+| `directory` | Path to photos directory | Prompted |
+| `--cutoff YEAR` | Skip photos from this year or later | 2010 |
+| `--confidence 1-10` | Confidence threshold for auto-write | 7 |
+| `--xmp-only` | Write to XMP sidecar files only | Off |
+| `--geotag` | Enable geotagging via Nominatim | Off |
+| `-r`, `--recursive` | Recursively process all subfolders | Off |
+| `--consensus` | Use folder consensus year for low-confidence dates | Off |
 
 If you scanned the backs of photos, place them immediately after the front in filename order (e.g. `img001.jpg` front, `img002.jpg` back). The script will detect and pair them automatically.
 
