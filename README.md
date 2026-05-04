@@ -15,6 +15,8 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 - Writes `DateTimeOriginal` into EXIF and keywords/captions into IPTC metadata
 - Optionally geotags photos by identifying locations from visual clues and resolving GPS coordinates via Nominatim
 - Low-confidence date estimates are skipped and logged to a `review.html` report for manual review
+- Optional folder consensus mode uses the most common year across high-confidence results to correct low-confidence estimates in the same folder
+- Handles VLM date ranges (e.g. `1975–1978`) by using the midpoint year
 - Supports `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.png`, `.heic`, `.webp`, `.dng`, and raw formats (`.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`, `.raw`)
 - DNG files are written as `.xmp` sidecar files, compatible with Lightroom and Apple Photos
 - All images are converted to JPEG and downscaled to a maximum of 2048px on the long edge before being sent to LM Studio — keeping API calls fast while staying within LM Studio's JPEG/PNG/WebP support
@@ -86,6 +88,7 @@ Confidence threshold (1-10) [7]: 7
 Write metadata to XMP sidecar files only? [y/N]: n
 Enable geotagging? [y/N]: n
 Recursively process subfolders? [y/N]: y
+Average dates in each folder using consensus year? [y/N]: y
 ```
 
 Or pass the directory as a command line argument:
@@ -105,7 +108,7 @@ If you scanned the backs of photos, place them immediately after the front in fi
 3. **AI analysis** — A single VLM call analyzes the image and returns all of the following in one pass: date estimate and confidence (if date is still unknown), time of day from lighting and shadows, a one-sentence scene description, indoor/outdoor setting, whether flash fired, location clues (if geotagging is enabled), and 5 descriptive keywords. The folder name is always passed as high-confidence date and location information for the VLM to weight accordingly. The estimated time is written into the `DateTimeOriginal` EXIF timestamp.
 4. **Geotagging** — If enabled, uses the location returned by the VLM in step 3 and resolves it to GPS coordinates via Nominatim.
 5. **Keywords** — Confirmed from the VLM's step 3 response — no additional call needed.
-6. **Metadata writing** — Valid dates before the cutoff year are written into the file along with the generated keywords and any comments extracted from the back. Low-confidence estimates are added to a `review.html` report instead of being written. DNG files receive a `.xmp` sidecar instead of direct EXIF modification.
+6. **Metadata writing** — Valid dates before the cutoff year are written into the file along with the generated keywords and any comments extracted from the back. If folder consensus mode is enabled, writes are deferred until all photos in the folder are analyzed — the most common year among high-confidence results is then applied to low-confidence photos (keeping their individual month/day/time) before writing. Low-confidence estimates with no consensus available are added to a `review.html` report. DNG and raw files receive a `.xmp` sidecar instead of direct EXIF modification.
 
 ---
 
