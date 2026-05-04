@@ -59,6 +59,11 @@ def parse_fuzzy_date(text):
     m = re.search(r'(\d{4})[:/-](\d{2})', text)
     if m:
         return f"{m.group(1)}:{m.group(2)}:01 12:00:00", None
+    # Year range e.g. "1975-1978" or "1975–1978" — use the midpoint year
+    m = re.search(r'\b(\d{4})\s*[-–]\s*(\d{4})\b', text)
+    if m:
+        mid = (int(m.group(1)) + int(m.group(2))) // 2
+        return f"{mid}:01:01 12:00:00", text.strip()
     # Bare 4-digit year
     m = re.search(r'\b(\d{4})\b', text)
     if m:
@@ -398,9 +403,10 @@ def _parse_time_of_day(text):
         return 21
     return 12  # default noon
 
-def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo):
+def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, global_offset=0, global_total=None, folder_consensus=False):
     processed_files = set()
     review_queue = []
+    results = []  # collects (path, found_date, confidence, tags, comment, raw_date, gps, scene, setting, flash)
 
     # Pass folder name directly to VLM as context
     folder_name = os.path.basename(folder)
@@ -420,7 +426,9 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         confidence = 10  # default high for back-of-photo and EXIF dates
         gps_coords = None
 
-        print(f"\n[{i+1}/{len(files)}] Processing: {current_file}")
+        pos = global_offset + i + 1
+        total_str = str(global_total) if global_total else str(len(files))
+        print(f"\n[{pos}/{total_str}] Processing: {current_file}")
 
         # Step 1: Check if the NEXT photo is the back
         back_confirmed = False
@@ -633,30 +641,81 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         else:
             print(f"   5) No keywords returned by VLM.")
 
-        # Step 6: Write metadata
+        # Step 6: Write metadata (deferred if folder_consensus is on)
         print(f"   6) Writing metadata...")
         if found_date:
             try:
                 year = int(found_date[:4])
                 if year < cutoff_year:
-                    if confidence >= confidence_threshold:
-                        apply_metadata(current_path, found_date, tags=tags_resp, comment=found_comment,
-                                       raw_date=raw_date_text, gps=gps_coords, xmp_only=xmp_only,
-                                       scene=vlm_scene, setting=vlm_setting, flash=vlm_flash)
+                    results.append({
+                        "file": current_file,
+                        "path": current_path,
+                        "found_date": found_date,
+                        "confidence": confidence,
+                        "tags": tags_resp,
+                        "comment": found_comment,
+                        "raw_date": raw_date_text,
+                        "gps": gps_coords,
+                        "scene": vlm_scene,
+                        "setting": vlm_setting,
+                        "flash": vlm_flash,
+                    })
+                    if not folder_consensus:
+                        if confidence >= confidence_threshold:
+                            apply_metadata(current_path, found_date, tags=tags_resp, comment=found_comment,
+                                           raw_date=raw_date_text, gps=gps_coords, xmp_only=xmp_only,
+                                           scene=vlm_scene, setting=vlm_setting, flash=vlm_flash)
+                        else:
+                            print(f"      ⚠️  Low confidence ({confidence}/10) — added to review queue.")
+                            review_queue.append({
+                                "file": current_file,
+                                "raw_guess": raw_date_text or found_date,
+                                "confidence": confidence,
+                                "comment": found_comment or "—"
+                            })
                     else:
-                        print(f"      ⚠️  Low confidence ({confidence}/10) — added to review queue.")
-                        review_queue.append({
-                            "file": current_file,
-                            "raw_guess": raw_date_text or found_date,
-                            "confidence": confidence,
-                            "comment": found_comment or "—"
-                        })
+                        print(f"      Queued for consensus write.")
                 else:
                     print(f"      ⏭️  Skipping: date {year} is {cutoff_year} or later.")
             except Exception as e:
                 print(f"      ❌ Write error: {e}")
         else:
             print(f"      ❌ No date found — skipping.")
+
+    # Apply folder consensus year if enabled
+    if folder_consensus and results:
+        from collections import Counter
+        # Collect years from high-confidence results only
+        high_conf_years = [
+            int(r['found_date'][:4])
+            for r in results
+            if r['confidence'] >= confidence_threshold
+        ]
+        if high_conf_years:
+            consensus_year = Counter(high_conf_years).most_common(1)[0][0]
+            print(f"\n   🗳️  Folder consensus year: {consensus_year} "
+                  f"(from {len(high_conf_years)} high-confidence result(s))")
+        else:
+            consensus_year = None
+            print(f"\n   ⚠️  No high-confidence results to derive consensus year.")
+
+        for r in results:
+            date = r['found_date']
+            if consensus_year and r['confidence'] < confidence_threshold:
+                # Apply consensus year, keep individual month/day/time
+                date = f"{consensus_year}:{date[5:]}"
+                print(f"      📅 {r['file']}: low-confidence date overridden to {date} via consensus")
+            if r['confidence'] >= confidence_threshold or consensus_year:
+                apply_metadata(r['path'], date, tags=r['tags'], comment=r['comment'],
+                               raw_date=r['raw_date'], gps=r['gps'], xmp_only=xmp_only,
+                               scene=r['scene'], setting=r['setting'], flash=r['flash'])
+            else:
+                review_queue.append({
+                    "file": r['file'],
+                    "raw_guess": r['raw_date'] or date,
+                    "confidence": r['confidence'],
+                    "comment": r['comment'] or "—"
+                })
 
     write_review_report(folder, review_queue)
 
@@ -677,7 +736,7 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
     print(f"{'─'*50}")
 
 
-def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False, recursive=False):
+def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False, recursive=False, folder_consensus=False):
     if not os.path.exists(folder):
         print(f"Directory {folder} not found.")
         return
@@ -689,15 +748,20 @@ def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=F
                 if f.lower().endswith(EXTENSIONS):
                     all_paths.append(os.path.join(root, f))
         all_paths = natsorted(all_paths)
+        global_total = len(all_paths)
+        print(f"\n📂 Found {global_total} files across all subfolders.")
         from itertools import groupby
+        global_offset = 0
         for subfolder, path_iter in groupby(all_paths, key=os.path.dirname):
             subfolder_files = [os.path.basename(p) for p in path_iter]
             print(f"\n📁 Processing folder: {subfolder} ({len(subfolder_files)} files)")
-            _process_folder(subfolder, subfolder_files, cutoff_year, confidence_threshold, xmp_only, enable_geo)
+            _process_folder(subfolder, subfolder_files, cutoff_year, confidence_threshold, xmp_only, enable_geo,
+                            global_offset=global_offset, global_total=global_total, folder_consensus=folder_consensus)
+            global_offset += len(subfolder_files)
         return
 
     files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(EXTENSIONS)])
-    _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo)
+    _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, folder_consensus=folder_consensus)
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -726,5 +790,6 @@ if __name__ == "__main__":
     xmp_only = input("Write metadata to XMP sidecar files only? [y/N]: ").strip().lower() == "y"
     enable_geo = input("Enable geotagging? [y/N]: ").strip().lower() == "y"
     recursive = input("Recursively process subfolders? [y/N]: ").strip().lower() == "y"
+    folder_consensus = input("Average dates in each folder using consensus year? [y/N]: ").strip().lower() == "y"
 
-    process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo, recursive)
+    process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo, recursive, folder_consensus)
