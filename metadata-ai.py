@@ -767,29 +767,83 @@ def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=F
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        directory = sys.argv[1]
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Metadata-AI — automatically tag and date scanned photos using a local VLM.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python metadata-ai.py                          # fully interactive\n"
+            "  python metadata-ai.py /path/to/photos          # prompts for remaining options\n"
+            "  python metadata-ai.py /path/to/photos -r --geotag --consensus\n"
+            "  python metadata-ai.py /path/to/photos --cutoff 1995 --confidence 6 --xmp-only"
+        )
+    )
+    parser.add_argument("directory", nargs="?", default=None,
+                        help="Path to photos directory (prompted if omitted)")
+    parser.add_argument("--cutoff", type=int, default=None, metavar="YEAR",
+                        help="Skip photos dated from this year or later (default: 2010)")
+    parser.add_argument("--confidence", type=int, default=None, metavar="1-10",
+                        help="Confidence threshold for auto-write (default: 7)")
+    parser.add_argument("--xmp-only", action="store_true", default=None,
+                        help="Write metadata to XMP sidecar files only")
+    parser.add_argument("--geotag", action="store_true", default=None,
+                        help="Enable geotagging via Nominatim")
+    parser.add_argument("-r", "--recursive", action="store_true", default=None,
+                        help="Recursively process all subfolders")
+    parser.add_argument("--consensus", action="store_true", default=None,
+                        help="Use folder consensus year to correct low-confidence date estimates")
+
+    args = parser.parse_args()
+
+    # Directory — prompt if not provided
+    if args.directory:
+        directory = re.sub(r'\\(.)', r'\1', args.directory.strip())
     else:
         raw = input(f"Enter photos directory [{DIRECTORY}]: ").strip()
-        import re as _re
-        directory = _re.sub(r'\\(.)', r'\1', raw) or DIRECTORY
+        directory = re.sub(r'\\(.)', r'\1', raw) or DIRECTORY
 
-    cutoff_input = input("Skip photos dated from which year or later? [2010]: ").strip()
-    try:
-        cutoff_year = int(cutoff_input) if cutoff_input else 2010
-    except ValueError:
-        print("Invalid year, defaulting to 2010.")
-        cutoff_year = 2010
+    # Cutoff year
+    if args.cutoff is not None:
+        cutoff_year = args.cutoff
+    else:
+        cutoff_input = input("Skip photos dated from which year or later? [2010]: ").strip()
+        try:
+            cutoff_year = int(cutoff_input) if cutoff_input else 2010
+        except ValueError:
+            print("Invalid year, defaulting to 2010.")
+            cutoff_year = 2010
 
-    conf_input = input("Confidence threshold for auto-write (1-10) [7]: ").strip()
-    try:
-        confidence_threshold = int(conf_input) if conf_input else 7
-    except ValueError:
-        confidence_threshold = 7
+    # Confidence threshold
+    if args.confidence is not None:
+        confidence_threshold = args.confidence
+    else:
+        conf_input = input("Confidence threshold for auto-write (1-10) [7]: ").strip()
+        try:
+            confidence_threshold = int(conf_input) if conf_input else 7
+        except ValueError:
+            confidence_threshold = 7
 
-    xmp_only = input("Write metadata to XMP sidecar files only? [y/N]: ").strip().lower() == "y"
-    enable_geo = input("Enable geotagging? [y/N]: ").strip().lower() == "y"
-    recursive = input("Recursively process subfolders? [y/N]: ").strip().lower() == "y"
-    folder_consensus = input("Average dates in each folder using consensus year? [y/N]: ").strip().lower() == "y"
+    # Boolean flags — skip prompts if provided via CLI
+    if args.xmp_only is not None:
+        xmp_only = args.xmp_only
+    else:
+        xmp_only = input("Write metadata to XMP sidecar files only? [y/N]: ").strip().lower() == "y"
+
+    if args.geotag is not None:
+        enable_geo = args.geotag
+    else:
+        enable_geo = input("Enable geotagging? [y/N]: ").strip().lower() == "y"
+
+    if args.recursive is not None:
+        recursive = args.recursive
+    else:
+        recursive = input("Recursively process subfolders? [y/N]: ").strip().lower() == "y"
+
+    if args.consensus is not None:
+        folder_consensus = args.consensus
+    else:
+        folder_consensus = input("Average dates in each folder using consensus year? [y/N]: ").strip().lower() == "y"
 
     process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo, recursive, folder_consensus)
