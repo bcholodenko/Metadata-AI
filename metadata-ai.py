@@ -53,17 +53,18 @@ def parse_fuzzy_date(text):
     """Try to extract a normalised EXIF date string from vague text. Returns (date_str, raw_text) or (None, None)."""
     if not text:
         return None, None
+    # Year range must be checked first e.g. "1968-1969" or "1975–1978"
+    # otherwise YYYY:MM patterns greedily match "1968-19" as year/month
+    m = re.search(r'\b(\d{4})\s*[-–]\s*(\d{4})\b', text)
+    if m:
+        mid = (int(m.group(1)) + int(m.group(2))) // 2
+        return f"{mid}:01:01 12:00:00", text.strip()
     m = re.search(r'(\d{4})[:/-](\d{2})[:/-](\d{2})', text)
     if m:
         return f"{m.group(1)}:{m.group(2)}:{m.group(3)} 12:00:00", None
     m = re.search(r'(\d{4})[:/-](\d{2})', text)
     if m:
         return f"{m.group(1)}:{m.group(2)}:01 12:00:00", None
-    # Year range e.g. "1975-1978" or "1975–1978" — use the midpoint year
-    m = re.search(r'\b(\d{4})\s*[-–]\s*(\d{4})\b', text)
-    if m:
-        mid = (int(m.group(1)) + int(m.group(2))) // 2
-        return f"{mid}:01:01 12:00:00", text.strip()
     # Bare 4-digit year
     m = re.search(r'\b(\d{4})\b', text)
     if m:
