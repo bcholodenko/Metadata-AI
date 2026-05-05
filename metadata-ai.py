@@ -3,6 +3,7 @@ import io
 import sys
 import base64
 import re
+import warnings
 
 # Force line-buffered output so progress prints appear immediately in the terminal
 sys.stdout.reconfigure(line_buffering=True)
@@ -53,50 +54,64 @@ def parse_fuzzy_date(text):
     """Try to extract a normalised EXIF date string from vague text. Returns (date_str, raw_text) or (None, None)."""
     if not text:
         return None, None
-    # Year range must be checked first e.g. "1968-1969" or "1975–1978"
-    # otherwise YYYY:MM patterns greedily match "1968-19" as year/month
-    m = re.search(r'\b(\d{4})\s*[-–]\s*(\d{4})\b', text)
-    if m:
-        mid = (int(m.group(1)) + int(m.group(2))) // 2
-        return f"{mid}:01:01 12:00:00", text.strip()
+    # Try unambiguous formats first
     m = re.search(r'(\d{4})[:/-](\d{2})[:/-](\d{2})', text)
     if m:
         return f"{m.group(1)}:{m.group(2)}:{m.group(3)} 12:00:00", None
-    m = re.search(r'(\d{4})[:/-](\d{2})', text)
-    if m:
-        return f"{m.group(1)}:{m.group(2)}:01 12:00:00", None
     # Bare 4-digit year
     m = re.search(r'\b(\d{4})\b', text)
     if m:
         return f"{m.group(1)}:01:01 12:00:00", None
+    # Fuzzy decade patterns
     for pattern, formatter in FUZZY_DATE_PATTERNS:
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
             return formatter(m), text.strip()
+    # Anything else — let the VLM normalize it (handles ranges, short years, etc.)
+    normalized = normalize_date_with_vlm(text)
+    if normalized:
+        return normalized, text.strip()
     return None, None
 
 # ---------------------------------------------------------------------------
 # IPTC helper
 # ---------------------------------------------------------------------------
 def get_iptc_metadata(path):
-    """Extracts existing IPTC metadata for checking and VLM context."""
+    """Extracts existing IPTC keywords for date checking."""
     try:
         info = IPTCInfo(path, force=True)
-        raw_date = info['date created'].decode('utf-8') if info['date created'] else None
-        caption = info['caption/abstract'].decode('utf-8') if info['caption/abstract'] else None
         keywords = [k.decode('utf-8') for k in info['keywords']] if info['keywords'] else []
-
-        formatted_date = None
-        if raw_date and len(raw_date) == 8:
-            formatted_date = f"{raw_date[:4]}:{raw_date[4:6]}:{raw_date[6:8]} 12:00:00"
-
-        return formatted_date, caption, keywords
+        return keywords
     except Exception:
-        return None, None, []
+        return []
 
 # ---------------------------------------------------------------------------
 # Image & API helpers
 # ---------------------------------------------------------------------------
+def normalize_date_with_vlm(raw_text):
+    """Ask the VLM to extract a single year from an ambiguous date string.
+    Used as a fallback when parse_fuzzy_date can't resolve cleanly."""
+    try:
+        response = CLIENT.chat.completions.create(
+            model=MODEL_ID,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Extract the most likely single year from this date string: '{raw_text}'. "
+                    "Reply with ONLY a 4-digit year, nothing else. "
+                    "If it's a range like '1992-93' or '1992-1993', return the start year."
+                )
+            }],
+            max_tokens=10
+        )
+        year_str = response.choices[0].message.content.strip()
+        m = re.search(r'\b(\d{4})\b', year_str)
+        if m:
+            return f"{m.group(1)}:01:01 12:00:00"
+    except Exception:
+        pass
+    return None
+
 def get_jpeg_base64(image_path):
     """
     Opens an image, downscales it so the long edge is at most VLM_MAX_DIMENSION,
@@ -109,7 +124,6 @@ def get_jpeg_base64(image_path):
 
     Raw formats (.cr2, .cr3, .nef, etc.) are decoded via rawpy if available.
     """
-    import warnings
     ext = os.path.splitext(image_path)[1].lower()
     if ext in RAW_EXTENSIONS:
         try:
@@ -165,7 +179,10 @@ def run_tesseract(image_path):
     """Runs Tesseract OCR on an image. Returns extracted text or None if Tesseract is not installed."""
     try:
         import pytesseract
-        img = Image.open(image_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            img = Image.open(image_path)
+            img.load()
         return pytesseract.image_to_string(img).strip()
     except ImportError:
         return None
@@ -270,7 +287,7 @@ def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, 
             )
         comment_parts = []
         if comment:
-            comment_parts.append(f"Comment: {comment}")
+            comment_parts.append(comment)
         if raw_date:
             comment_parts.append(f"Raw date: {raw_date}")
         comment_xml = ""
@@ -304,11 +321,12 @@ def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, 
 # ---------------------------------------------------------------------------
 # Review queue
 # ---------------------------------------------------------------------------
-def write_review_report(folder, review_queue):
-    """Writes an HTML report of low-confidence photos for manual review."""
+def write_review_report(folder, review_queue, root_folder=None):
+    """Writes an HTML report of low-confidence photos for manual review.
+    In recursive mode, root_folder is passed so all folders share one report."""
     if not review_queue:
         return
-    report_path = os.path.join(folder, "review.html")
+    report_path = os.path.join(root_folder or folder, "review.html")
     rows = ""
     for item in review_queue:
         rows += f"""
@@ -365,6 +383,42 @@ def geolocate(location_text):
 # ---------------------------------------------------------------------------
 # Main archival loop
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Checkpoint / resume helpers
+# ---------------------------------------------------------------------------
+def _has_existing_date(path):
+    """Returns True if the file already has a DateTimeOriginal tag written by exiftool."""
+    import subprocess, shutil
+    if not shutil.which("exiftool"):
+        return False
+    try:
+        result = subprocess.run(
+            ["exiftool", "-DateTimeOriginal", "-s3", path],
+            capture_output=True, text=True
+        )
+        return bool(result.stdout.strip())
+    except Exception:
+        return False
+
+def _checkpoint_path(root_folder):
+    return os.path.join(root_folder, ".metadata-ai-progress")
+
+def _load_checkpoint(root_folder):
+    path = _checkpoint_path(root_folder)
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+def _save_checkpoint(root_folder, completed_path):
+    with open(_checkpoint_path(root_folder), 'a') as f:
+        f.write(completed_path + '\n')
+
+def _clear_checkpoint(root_folder):
+    path = _checkpoint_path(root_folder)
+    if os.path.exists(path):
+        os.remove(path)
+
 def _parse_time_of_day(text):
     """Converts a natural language time estimate to an hour (0-23). Returns 12 if unparseable."""
     text = text.lower().strip()
@@ -404,10 +458,13 @@ def _parse_time_of_day(text):
         return 21
     return 12  # default noon
 
-def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, global_offset=0, global_total=None, folder_consensus=False):
+def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, global_offset=0, global_total=None, folder_consensus=False, root_folder=None, dry_run=False, skip_dated=False):
     processed_files = set()
     review_queue = []
     results = []  # collects (path, found_date, confidence, tags, comment, raw_date, gps, scene, setting, flash)
+    completed_paths = _load_checkpoint(root_folder or folder)
+    no_date_count = 0
+    cutoff_skip_count = 0
 
     # Pass folder name directly to VLM as context
     folder_name = os.path.basename(folder)
@@ -429,6 +486,17 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
 
         pos = global_offset + i + 1
         total_str = str(global_total) if global_total else str(len(files))
+
+        # Resume support — skip files already completed in a previous run
+        if current_path in completed_paths:
+            print(f"\n[{pos}/{total_str}] Skipping (already processed): {current_file}")
+            continue
+
+        # Skip-dated — skip files that already have a DateTimeOriginal tag
+        if skip_dated and _has_existing_date(current_path):
+            print(f"\n[{pos}/{total_str}] Skipping (already dated): {current_file}")
+            continue
+
         print(f"\n[{pos}/{total_str}] Processing: {current_file}")
 
         # Step 1: Check if the NEXT photo is the back
@@ -451,18 +519,21 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 next_readable = False
                 print(f"      Could not open {next_file} — skipping back check.")
 
-            is_back_prompt = (
-                "Look very carefully at this image. Is it the BACK (reverse side) of a physical printed photograph? "
-                "The back would show: blank paper, handwriting, stamps, photo lab printing, or a plain surface. "
-                "If you see any photographic image content AT ALL, answer No. "
-                "Answer ONLY 'Yes' or 'No'."
+            # Single VLM call: detect back AND extract date + comment simultaneously
+            back_prompt = (
+                "Look very carefully at this image. "
+                "First determine: is this the BACK (reverse side) of a physical printed photograph? "
+                "The back shows blank paper, handwriting, stamps, photo lab printing, or a plain surface — no photographic scene. "
+                "Reply in this exact format:\n"
+                "IS_BACK: <yes or no>\n"
+                "DATE: <any date written on it in YYYY:MM:DD format, or 'circa 1950s', or 'none'>\n"
+                "COMMENT: <any other handwritten or printed text excluding dates, translated to English, or 'none'>"
             )
-            is_back_resp = ask_vlm(next_path, is_back_prompt) if next_readable else ""  
+            back_resp = ask_vlm(next_path, back_prompt) if next_readable else ""
             is_back = False
-            if is_back_resp.strip().lower().startswith("yes"):
-                confirm_prompt = "Does this image show a photographic scene with people, places, or objects? Answer ONLY 'Yes' or 'No'."
-                confirm_resp = ask_vlm(next_path, confirm_prompt)
-                if not confirm_resp.strip().lower().startswith("yes"):
+            if back_resp:
+                is_back_line = re.search(r'IS_BACK:\s*([^\n]+)', back_resp)
+                if is_back_line and is_back_line.group(1).strip().lower().startswith("yes"):
                     is_back = True
 
             if is_back:
@@ -470,31 +541,30 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 print(f"      Back confirmed: {next_file}")
                 processed_files.add(next_file)
 
-                # Run Tesseract first if available, then feed to VLM
-                ocr_context = run_tesseract(next_path)
-                context_str = f"\n\nOCR pre-extracted text from this image:\n{ocr_context}" if ocr_context else ""
+                date_line = re.search(r'DATE:\s*([^\n]+)', back_resp)
+                comment_line = re.search(r'COMMENT:\s*([^\n]+)', back_resp)
+                raw_date_str = date_line.group(1).strip() if date_line else "none"
+                raw_comment = comment_line.group(1).strip() if comment_line else "none"
 
-                ocr_prompt = (
-                    f"Extract any date written on this photo back.{context_str} "
-                    "Return ONLY in YYYY:MM:DD format, or a description like 'circa 1950s', 'early 1970s'. "
-                    "If no date is present, return 'none'."
-                )
-                resp = ask_vlm(next_path, ocr_prompt)
-                found_date, raw_date_text = parse_fuzzy_date(resp)
+                # Optionally enrich with Tesseract OCR if available
+                ocr_context = run_tesseract(next_path)
+                if ocr_context and raw_date_str.lower() == "none":
+                    # Tesseract found something the VLM missed — re-ask just for the date
+                    ocr_prompt = (
+                        f"This is the back of a photo. OCR extracted: {ocr_context}\n"
+                        "Extract any date from this text in YYYY:MM:DD format, or 'circa 1950s', etc. "
+                        "If no date, return 'none'."
+                    )
+                    raw_date_str = ask_vlm(next_path, ocr_prompt).strip()
+
+                found_date, raw_date_text = parse_fuzzy_date(raw_date_str)
                 if found_date:
                     print(f"      Date from back: {found_date}" + (f" (fuzzy: {raw_date_text})" if raw_date_text else ""))
                 else:
                     print(f"      No date on back — falling through to VLM guess.")
 
-                # Extract comments
-                comment_prompt = (
-                    f"Extract any handwritten or printed text from this photo back, excluding any dates.{context_str} "
-                    "If the text is not in English, translate it to English. "
-                    "Return only the final English text, or 'none' if there is no text."
-                )
-                comment_resp = ask_vlm(next_path, comment_prompt)
-                if comment_resp.strip().lower() != "none" and comment_resp.strip():
-                    found_comment = comment_resp.strip()
+                if raw_comment.lower() != "none" and raw_comment:
+                    found_comment = raw_comment
                     print(f"      Comment from back: {found_comment}")
                 else:
                     print(f"      No comment on back.")
@@ -506,11 +576,22 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         # Step 2: Check IPTC keywords for a date
         if not found_date:
             print(f"   2) Checking IPTC keywords for date...")
-            _, _, iptc_keywords = get_iptc_metadata(current_path)
+            iptc_keywords = get_iptc_metadata(current_path)
             if iptc_keywords:
                 for keyword in iptc_keywords:
+                    # Skip keywords with no digits — they cannot contain a date
+                    if not re.search(r'\d', keyword):
+                        continue
                     found_date, raw_date_text = parse_fuzzy_date(keyword)
                     if found_date:
+                        try:
+                            yr = int(found_date.split(':')[0])
+                            if not (1826 <= yr <= 2100):
+                                found_date = None
+                                continue
+                        except (ValueError, IndexError):
+                            found_date = None
+                            continue
                         print(f"      Date parsed from IPTC keyword '{keyword}': {found_date}" + (f" (fuzzy: {raw_date_text})" if raw_date_text else ""))
                         break
                 if not found_date:
@@ -576,10 +657,13 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             confidence = int(conf_line.group(1)) if conf_line else 5
             found_date, raw_date_text = parse_fuzzy_date(raw_guess)
             if found_date:
-                # Validate month and day are in range
+                # Validate year, month, and day are in plausible range
                 parts = found_date.split(':')
                 try:
-                    if not (1 <= int(parts[1]) <= 12 and 1 <= int(parts[2].split()[0]) <= 31):
+                    year_val = int(parts[0])
+                    month_val = int(parts[1])
+                    day_val = int(parts[2].split()[0])
+                    if not (1826 <= year_val <= 2100 and 1 <= month_val <= 12 and 1 <= day_val <= 31):
                         print(f"      Invalid date from VLM ('{raw_guess}') — discarding.")
                         found_date = None
                     else:
@@ -594,11 +678,36 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             """Strip markdown formatting characters from VLM field values."""
             return re.sub(r'[*_`#]', '', s).strip() if s else s
 
-        raw_time    = clean(time_line.group(1))         if time_line    else None
+        _raw_time_str = clean(time_line.group(1)) if time_line else None
+        # If the VLM returned a long explanation instead of a simple time value, discard it
+        raw_time = _raw_time_str if _raw_time_str and len(_raw_time_str) < 40 and not any(
+            w in _raw_time_str.lower() for w in [
+                "not applicable", "cannot", "studio", "artificial", "controlled",
+                "indoor lighting", "specific time", "unable", "n/a", "unknown"
+            ]
+        ) else None
         vlm_scene   = clean(scene_line.group(1))        if scene_line   else None
-        vlm_setting = clean(setting_line.group(1))      if setting_line else None
-        vlm_flash   = clean(flash_line.group(1)).lower() if flash_line   else None
-        tags_resp   = clean(keywords_line.group(1))     if keywords_line else None
+        _raw_setting = clean(setting_line.group(1)) if setting_line else None
+        _raw_flash   = clean(flash_line.group(1)).lower() if flash_line else None
+        # Discard verbose multi-sentence responses — keep only short single-word/phrase answers
+        vlm_setting = _raw_setting if _raw_setting and len(_raw_setting) < 30 else None
+        vlm_flash   = None
+        if _raw_flash:
+            if _raw_flash.startswith('yes'):
+                vlm_flash = 'yes'
+            elif _raw_flash.startswith('no'):
+                vlm_flash = 'no'
+
+        # Filter time-of-day words from keywords
+        _raw_keywords = clean(keywords_line.group(1)) if keywords_line else None
+        if _raw_keywords:
+            _time_words = {"morning", "midday", "noon", "afternoon", "evening",
+                           "night", "dawn", "dusk", "sunrise", "sunset", "golden hour"}
+            filtered = [k.strip().lower() for k in _raw_keywords.split(',')
+                        if k.strip().lower() not in _time_words]
+            tags_resp = ', '.join(filtered) if filtered else None
+        else:
+            tags_resp = None
         geo_resp_inline = clean(geo_line.group(1))      if geo_line     else None
 
         if raw_time:    print(f"      Time:       {raw_time}")
@@ -617,12 +726,16 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         if enable_geo:
             print(f"   4) Checking for location clues...")
             geo_resp = geo_resp_inline or ""
+            # Strip parenthetical explanations e.g. "Region 84 (likely Southern California...)"
+            geo_resp = re.sub(r'\s*\(.*?\)', '', geo_resp).strip()
             is_valid_location = (
                 geo_resp.lower() not in ("", "none")
-                and len(geo_resp) < 100
+                and len(geo_resp) < 80
+                and geo_resp.lower() != folder_name.lower()
                 and not any(phrase in geo_resp.lower() for phrase in [
                     "no identifiable", "no clear", "cannot identify", "unable to",
-                    "no location", "no specific", "there are no", "i cannot", "i can't"
+                    "no location", "no specific", "there are no", "i cannot", "i can't",
+                    "unsorted", "folder", "unknown", "region", "likely"
                 ])
             )
             if is_valid_location:
@@ -631,8 +744,17 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 if gps_coords:
                     print(f"      GPS: {gps_coords[0]:.4f}, {gps_coords[1]:.4f}")
                 else:
-                    print(f"      Could not resolve GPS — storing as text tag.")
-                    found_comment = (found_comment + f" | Location: {geo_resp}") if found_comment else f"Location: {geo_resp}"
+                    # Retry with just the first part of the location (before any comma)
+                    simplified = geo_resp.split(',')[0].strip()
+                    if simplified and simplified.lower() != geo_resp.lower():
+                        print(f"      Retrying with simplified location: '{simplified}'")
+                        gps_coords = geolocate(simplified)
+                        if gps_coords:
+                            print(f"      GPS: {gps_coords[0]:.4f}, {gps_coords[1]:.4f}")
+                        else:
+                            print(f"      Could not resolve GPS — skipping location tag.")
+                    else:
+                        print(f"      Could not resolve GPS — skipping location tag.")
             else:
                 print(f"      No location identified.")
 
@@ -663,9 +785,13 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                     })
                     if not folder_consensus:
                         if confidence >= confidence_threshold:
-                            apply_metadata(current_path, found_date, tags=tags_resp, comment=found_comment,
-                                           raw_date=raw_date_text, gps=gps_coords, xmp_only=xmp_only,
-                                           scene=vlm_scene, setting=vlm_setting, flash=vlm_flash)
+                            if dry_run:
+                                print(f"      [DRY RUN] Would write: {found_date} | tags: {tags_resp}")
+                            else:
+                                apply_metadata(current_path, found_date, tags=tags_resp, comment=found_comment,
+                                               raw_date=raw_date_text, gps=gps_coords, xmp_only=xmp_only,
+                                               scene=vlm_scene, setting=vlm_setting, flash=vlm_flash)
+                                _save_checkpoint(root_folder or folder, current_path)
                         else:
                             print(f"      ⚠️  Low confidence ({confidence}/10) — added to review queue.")
                             review_queue.append({
@@ -678,10 +804,12 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                         print(f"      Queued for consensus write.")
                 else:
                     print(f"      ⏭️  Skipping: date {year} is {cutoff_year} or later.")
+                    cutoff_skip_count += 1
             except Exception as e:
                 print(f"      ❌ Write error: {e}")
         else:
             print(f"      ❌ No date found — skipping.")
+            no_date_count += 1
 
     # Apply folder consensus year if enabled
     if folder_consensus and results:
@@ -707,9 +835,13 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 date = f"{consensus_year}:{date[5:]}"
                 print(f"      📅 {r['file']}: low-confidence date overridden to {date} via consensus")
             if r['confidence'] >= confidence_threshold or consensus_year:
-                apply_metadata(r['path'], date, tags=r['tags'], comment=r['comment'],
-                               raw_date=r['raw_date'], gps=r['gps'], xmp_only=xmp_only,
-                               scene=r['scene'], setting=r['setting'], flash=r['flash'])
+                if dry_run:
+                    print(f"      [DRY RUN] Would write: {date} | tags: {r['tags']}")
+                else:
+                    apply_metadata(r['path'], date, tags=r['tags'], comment=r['comment'],
+                                   raw_date=r['raw_date'], gps=r['gps'], xmp_only=xmp_only,
+                                   scene=r['scene'], setting=r['setting'], flash=r['flash'])
+                    _save_checkpoint(root_folder or folder, r['path'])
             else:
                 review_queue.append({
                     "file": r['file'],
@@ -718,26 +850,29 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                     "comment": r['comment'] or "—"
                 })
 
-    write_review_report(folder, review_queue)
+    write_review_report(folder, review_queue, root_folder=root_folder)
 
     # Summary
     total = len(files)
-    skipped = len(processed_files)  # back-of-photo files consumed
+    backs_consumed = len(processed_files)   # back-of-photo files skipped as fronts
     reviewed = len(review_queue)
-    written = total - skipped - reviewed - sum(
-        1 for f in files if f not in processed_files
-        and not any(r['file'] == f for r in review_queue)
-    )
+    written = max(0, total - backs_consumed - reviewed - no_date_count - cutoff_skip_count)
+
     print(f"\n{'─'*50}")
-    print(f"   📊 Folder summary: {total} files scanned")
-    if skipped:
-        print(f"      {skipped} back-of-photo file(s) consumed")
+    print(f"   📊 Folder summary: {total} file(s) scanned")
+    print(f"      ✅ {written} written")
+    if backs_consumed:
+        print(f"      🔄 {backs_consumed} back-of-photo file(s) consumed")
+    if cutoff_skip_count:
+        print(f"      ⏭️  {cutoff_skip_count} skipped (at or after cutoff year)")
     if reviewed:
-        print(f"      {reviewed} low-confidence file(s) added to review queue")
+        print(f"      📋 {reviewed} added to review queue (low confidence)")
+    if no_date_count:
+        print(f"      ❌ {no_date_count} skipped (no date found)")
     print(f"{'─'*50}")
 
 
-def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False, recursive=False, folder_consensus=False):
+def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False, recursive=False, folder_consensus=False, dry_run=False, skip_dated=False):
     if not os.path.exists(folder):
         print(f"Directory {folder} not found.")
         return
@@ -757,12 +892,17 @@ def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=F
             subfolder_files = [os.path.basename(p) for p in path_iter]
             print(f"\n📁 Processing folder: {subfolder} ({len(subfolder_files)} files)")
             _process_folder(subfolder, subfolder_files, cutoff_year, confidence_threshold, xmp_only, enable_geo,
-                            global_offset=global_offset, global_total=global_total, folder_consensus=folder_consensus)
+                            global_offset=global_offset, global_total=global_total, folder_consensus=folder_consensus,
+                            root_folder=folder, dry_run=dry_run, skip_dated=skip_dated)
             global_offset += len(subfolder_files)
+        if not dry_run:
+            _clear_checkpoint(folder)
         return
 
     files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(EXTENSIONS)])
-    _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, folder_consensus=folder_consensus)
+    _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, folder_consensus=folder_consensus, dry_run=dry_run, skip_dated=skip_dated)
+    if not dry_run:
+        _clear_checkpoint(folder)
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -795,6 +935,12 @@ if __name__ == "__main__":
                         help="Recursively process all subfolders")
     parser.add_argument("--consensus", action="store_true", default=None,
                         help="Use folder consensus year to correct low-confidence date estimates")
+    parser.add_argument("--dry-run", action="store_true", default=False,
+                        help="Analyze photos and print what would be written without modifying any files")
+    parser.add_argument("--skip-dated", action="store_true", default=False,
+                        help="Skip photos that already have a DateTimeOriginal tag written")
+    parser.add_argument("--model", type=str, default=None,
+                        help=f"LM Studio model ID to use (default: {MODEL_ID})")
 
     args = parser.parse_args()
 
@@ -847,4 +993,22 @@ if __name__ == "__main__":
     else:
         folder_consensus = input("Average dates in each folder using consensus year? [y/N]: ").strip().lower() == "y"
 
-    process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo, recursive, folder_consensus)
+    if args.model:
+        MODEL_ID = args.model
+        print(f"Using model: {MODEL_ID}")
+    if args.dry_run:
+        print("\n⚠️  DRY RUN MODE — no files will be modified.\n")
+
+    # Check for an existing progress file and offer to resume
+    progress_file = _checkpoint_path(directory)
+    if os.path.exists(progress_file):
+        with open(progress_file) as pf:
+            completed_count = sum(1 for line in pf if line.strip())
+        resume = input(f"\n⏸️  Found a previous session with {completed_count} completed file(s). Resume? [Y/n]: ").strip().lower()
+        if resume == "n":
+            _clear_checkpoint(directory)
+            print("   Starting fresh.\n")
+        else:
+            print("   Resuming previous session.\n")
+
+    process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo, recursive, folder_consensus, dry_run=args.dry_run, skip_dated=args.skip_dated)
