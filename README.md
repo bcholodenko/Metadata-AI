@@ -1,30 +1,42 @@
 <img width="600" alt="logo" src="https://github.com/user-attachments/assets/8bcf39fd-93c3-4017-96e0-7d692237b197" />
+# Metadata-AI
 
-Metadata-AI is a local AI-powered tool that automatically tags and dates scanned physical photographs by writing metadata directly into image files.
+Metadata-AI is a local, AI-powered tool that automatically tags and dates scanned physical photographs and home video by writing metadata directly into image EXIF/XMP and video container fields.
 
-It uses a vision language model (VLM) running locally via [LM Studio](https://lmstudio.ai) to analyze each photo, detect whether the next scanned image is the back of a photograph, extract handwritten dates and comments via OCR (translating to English if needed), and estimate dates from visual cues like fashion and technology when no written date is available.
+It runs a vision language model locally via [LM Studio](https://lmstudio.ai), so nothing leaves your machine. For each photo it can detect whether the next scan is the back of a print, OCR any handwritten dates and captions, fall back to estimating a date from visual cues (fashion, hairstyles, technology, setting), and produce a structured metadata record — all in a single VLM call per image. For video it samples frames, builds a date consensus across them, and synthesizes a written summary plus structured metadata fields you can review and edit before writing.
 
 ---
 
 ## Features
 
-- Detects back-of-photo scans and extracts handwritten dates via OCR
-- Extracts and saves handwritten comments from the back of photos, translating to English if needed
-- Passes the folder name to the VLM as high-confidence date and location information (e.g. `8-79 Hawaii` → August 1979, Hawaii)
-- Single VLM call per photo extracts date, time of day, scene description, indoor/outdoor setting, flash, keywords, and location — minimizing processing time
-- Writes `DateTimeOriginal` into EXIF and keywords/captions into IPTC metadata
-- Optionally geotags photos by identifying locations from visual clues and resolving GPS coordinates via Nominatim
-- Low-confidence date estimates are skipped and logged to a `review.html` report for manual review
-- Optional folder consensus mode uses the most common year across high-confidence results to correct low-confidence estimates in the same folder
-- Handles VLM date ranges (e.g. `1975–1978`) by using the midpoint year
-- Supports `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.png`, `.heic`, `.webp`, `.dng`, and raw formats (`.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`, `.raw`)
-- DNG files are written as `.xmp` sidecar files, compatible with Lightroom and Apple Photos
-- All images are converted to JPEG and downscaled to a maximum of 2048px on the long edge before being sent to LM Studio — keeping API calls fast while staying within LM Studio's JPEG/PNG/WebP support
-- Handles very large scanned photos (600–1200 DPI scans can exceed 100 MP) without crashing
-- Skips photos dated at or after a configurable cutoff year (default: 2010)
-- Can recursively process all subfolders within a directory
-- Runs entirely locally — no cloud API required
-- Prompts for photos directory at runtime, or accepts it as a command line argument
+### Photos
+
+- **Back-of-photo detection.** When a scan of the back of a print follows the front in filename order, Metadata-AI detects it, reads handwritten dates and comments via the VLM (and optionally Tesseract OCR for an extra pass), and translates non-English captions to English.
+- **Single-call image analysis.** One VLM round-trip per photo extracts: date estimate + confidence, time of day, one-sentence scene description, indoor/outdoor setting, whether flash fired, location (if geotagging is on), and 5 keywords.
+- **Folder-name as context, validated.** If the folder name carries useful information (`1985 Hawaii`, `Summer 1992`) it's passed to the VLM as a high-confidence hint. Noise like `New Folder (2)`, `Scans_Batch_3`, `untitled`, or `temp` is filtered out and not passed as context.
+- **Confidence-gated writes.** Date estimates below your confidence threshold are not written. Instead they're added to a `review.html` report at the end of the run with folder, filename, raw guess, confidence, and any extracted comment.
+- **Folder consensus mode.** Optional. After analyzing every photo in a folder, the most common year among high-confidence results is used to override low-confidence dates in the same folder while preserving each photo's individual month, day, and time-of-day.
+- **Standards-compliant metadata.** `DateTimeOriginal`, `dc:subject` keywords, GPS, scene caption (`dc:description` / EXIF `ImageDescription`), and `Flash` (proper EXIF `0x9209` structure with `Fired` field) — all written via XMP sidecar then merged into the file with ExifTool.
+- **Wide format support.** `.jpg`, `.jpeg`, `.tiff`, `.tif`, `.png`, `.heic`, `.webp`, `.dng`, and raw camera formats (`.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`, `.raw`).
+- **Large-scan safe.** Handles 600–1200 DPI scans that exceed 100 MP. Pillow's decompression bomb guard is raised to 500 MP (still catches genuinely corrupt files) and images are downscaled to 2048 px on the long edge before being sent to the VLM.
+
+### Videos
+
+- **Frame-by-frame analysis.** ffmpeg samples one frame every N seconds (default 30) and the VLM produces a one-sentence description, date guess, and confidence per frame.
+- **Date consensus across frames.** The most common year among high-confidence frames wins, with a clear plurality-vs-majority distinction in the report when agreement is low.
+- **Multi-paragraph summary.** A second VLM call synthesizes the per-frame descriptions into a 2–4 paragraph summary suitable for someone who hasn't seen the video. Truncation is detected and retried with fewer frames.
+- **Structured metadata extraction.** A third VLM call distills the summary into `title`, `description`, `keywords`, `location`, `genre`, `artist`, and `date` fields, written into the video container via `ffmpeg -c copy` (no re-encode).
+- **Edit-before-write.** Preview every metadata field, edit any of them inline, then choose whether to write to the video file or just save the analysis report.
+- **Supported formats.** `.mp4`, `.mov`, `.avi`, `.m4v`, `.mkv`, `.mts`, `.m2ts`, `.wmv`, `.flv`, `.webm`.
+
+### Workflow
+
+- **Resume support.** Long runs are checkpointed file-by-file. If the process is interrupted, you'll be offered the chance to resume from where it left off.
+- **Dry-run mode.** `--dry-run` analyzes everything and prints what would be written without modifying any files. Existing checkpoints are ignored in this mode.
+- **Skip already-dated photos.** `--skip-dated` skips any file that already has a `DateTimeOriginal` tag — useful for re-runs over a partially completed library.
+- **Recursive mode.** Walk an entire archive of subfolders in one run; the review queue is accumulated across all folders into a single `review.html` at the run root.
+- **Rate-limited geocoding.** Nominatim lookups respect the 1-second-minimum interval and are cached per location, so a 5,000-photo run won't get you IP-banned.
+- **Fully local.** No cloud APIs. The only outbound traffic is to Nominatim, and only if `--geotag` is enabled.
 
 ---
 
@@ -32,115 +44,159 @@ It uses a vision language model (VLM) running locally via [LM Studio](https://lm
 
 - Python 3.8+
 - [LM Studio](https://lmstudio.ai) running locally with a vision-capable model loaded
-- [ExifTool](https://exiftool.org) for writing metadata into all image formats (`brew install exiftool`)
-- [rawpy](https://letmaik.github.io/rawpy/) for opening raw camera formats (`pip install rawpy`)
+- [ExifTool](https://exiftool.org) for merging XMP into image files
+- [ffmpeg](https://ffmpeg.org) and ffprobe for video analysis (included by default in most ffmpeg installs)
+
+Optional:
+
+- [Tesseract](https://github.com/tesseract-ocr/tesseract) + `pytesseract` for an extra OCR pass on the backs of photos
+- `rawpy` for opening raw camera formats
+
+On macOS:
+
+```sh
+brew install exiftool ffmpeg libheif tesseract
+```
 
 ---
 
 ## Installation
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/bcholodenko/Metadata-AI.git
-   cd Metadata-AI
-   ```
+```sh
+git clone https://github.com/bcholodenko/Metadata-AI.git
+cd Metadata-AI
+pip install -r requirements.txt
+```
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+Optional extras:
 
-   > **Note:** HEIC support requires `pillow-heif`, which is included in `requirements.txt`. On some systems you may also need `libheif` installed via Homebrew: `brew install libheif`
+```sh
+pip install pytesseract rawpy
+```
 
-   > **Optional:** Install `pytesseract` and [Tesseract](https://github.com/tesseract-ocr/tesseract) to enable OCR on the backs of photos for handwritten date extraction. Without it, the VLM handles back-of-photo text alone. To enable: `pip install pytesseract` and `brew install tesseract`
-
-3. Open LM Studio, load a vision-capable model, and start the local server (default: `http://localhost:1234`).
+Open LM Studio, load a vision-capable model, and start the local server (default: `http://localhost:1234`).
 
 ---
 
 ## Configuration
 
-At the top of `metadata-ai.py`, set the following:
+The defaults at the top of `metadata-ai.py` are the ones you're most likely to change:
 
 ```python
-DIRECTORY = "./photos"         # Default fallback if no directory is provided at runtime
-MODEL_ID = "qwen/qwen3.6-27b" # Must match the model identifier in LM Studio
-VLM_MAX_DIMENSION = 2048       # Long-edge pixel cap before sending to VLM
+DIRECTORY = "./photos"          # Default fallback if no path is provided
+MODEL_ID = "qwen/qwen3.6-27b"   # Must match the model identifier in LM Studio
+VLM_MAX_DIMENSION = 2048        # Long-edge pixel cap before sending to VLM
 ```
 
-The cutoff year and other options are set interactively at runtime.
+Everything else is set per-run via CLI flags or interactive prompts.
 
 ---
 
 ## Usage
 
-Run fully interactively — you will be prompted for all options:
+### Photos — fully interactive
 
-```bash
+```sh
 python metadata-ai.py
 ```
 
-Example prompts:
-```
-Enter photos directory [./photos]: /Users/johnappleseed/Pictures/Scans
-Skip photos dated from which year or later? [2010]: 1995
-Confidence threshold (1-10) [7]: 7
-Write metadata to XMP sidecar files only? [y/N]: n
-Enable geotagging? [y/N]: n
-Recursively process subfolders? [y/N]: y
-Average dates in each folder using consensus year? [y/N]: y
-```
+You'll be prompted for the directory, cutoff year, confidence threshold, XMP-only mode, geotagging, recursion, and consensus mode in order.
 
-Or use CLI arguments to skip the prompts — any omitted flags will still be prompted:
+### Photos — non-interactive
 
-```bash
-# Fully non-interactive
+```sh
 python metadata-ai.py /path/to/photos --cutoff 1995 --confidence 7 -r --geotag --consensus
-
-# Mix of CLI and interactive — directory provided, rest prompted
-python metadata-ai.py /path/to/photos
-
-# XMP sidecar only, recursive
-python metadata-ai.py /path/to/photos -r --xmp-only
 ```
 
-All available flags:
+Any flag you omit will be prompted for.
+
+### Videos
+
+You can point Metadata-AI at a single video file directly:
+
+```sh
+python metadata-ai.py /path/to/clip.mov --video-interval 30
+```
+
+Or run interactively against a directory and answer "yes" when asked whether to analyze video files. Each video produces a `<name>_summary.txt` report; you'll be shown the metadata preview and asked to confirm before any write to the video file.
+
+### Single image
+
+Pass a single image path and Metadata-AI runs in one-file mode:
+
+```sh
+python metadata-ai.py /path/to/scan.tiff
+```
+
+### Dry run
+
+```sh
+python metadata-ai.py /path/to/photos --dry-run
+```
+
+Analyzes everything and prints what it *would* write. No files are modified, no checkpoint is created or read.
+
+### All flags
 
 | Flag | Description | Default |
-|---|---|---|
-| `directory` | Path to photos directory | Prompted |
-| `--cutoff YEAR` | Skip photos from this year or later | 2010 |
-| `--confidence 1-10` | Confidence threshold for auto-write | 7 |
-| `--xmp-only` | Write to XMP sidecar files only | Off |
-| `--geotag` | Enable geotagging via Nominatim | Off |
-| `-r`, `--recursive` | Recursively process all subfolders | Off |
-| `--consensus` | Use folder consensus year for low-confidence dates | Off |
+| --- | --- | --- |
+| `directory` (positional) | Path to a photo directory, single image, or video file | Prompted |
+| `--cutoff YEAR` | Skip photos dated at or after this year | 2010 |
+| `--confidence 1-10` | Minimum confidence to auto-write a date | 7 |
+| `--xmp-only` | Write to XMP sidecar files only; skip ExifTool merge | Off |
+| `--geotag` | Enable Nominatim geocoding for VLM-identified locations | Off |
+| `-r`, `--recursive` | Walk all subfolders | Off |
+| `--consensus` | Use folder-consensus year to override low-confidence dates | Off |
+| `--dry-run` | Analyze only; modify nothing; ignore checkpoints | Off |
+| `--skip-dated` | Skip files that already have `DateTimeOriginal` set | Off |
+| `--model ID` | Override the LM Studio model ID for this run | from script |
+| `--video PATH` | Run video mode on this file (skips photo prompts) | — |
+| `--video-interval SECONDS` | Frame sampling interval for video mode | 30 |
+| `--output PATH` | Output `.txt` report path for video mode | `<video>_summary.txt` |
 
-If you scanned the backs of photos, place them immediately after the front in filename order (e.g. `img001.jpg` front, `img002.jpg` back). The script will detect and pair them automatically.
-
----
-
-## How It Works
-
-1. **Back detection** — For each photo, the script checks if the next image is the reverse side of a physical print using a two-step VLM confirmation. If confirmed, it attempts to OCR a date and any handwritten comments from the back. Comments are translated to English if needed. If no date is found on the back, the script falls through to step 2.
-2. **IPTC keyword check** — Checks existing IPTC keywords on the photo for a parseable date (e.g. "Sep 1960" or "circa 1975").
-3. **AI analysis** — A single VLM call analyzes the image and returns all of the following in one pass: date estimate and confidence (if date is still unknown), time of day from lighting and shadows, a one-sentence scene description, indoor/outdoor setting, whether flash fired, location clues (if geotagging is enabled), and 5 descriptive keywords. The folder name is always passed as high-confidence date and location information for the VLM to weight accordingly. The estimated time is written into the `DateTimeOriginal` EXIF timestamp.
-4. **Geotagging** — If enabled, uses the location returned by the VLM in step 3 and resolves it to GPS coordinates via Nominatim.
-5. **Keywords** — Confirmed from the VLM's step 3 response — no additional call needed.
-6. **Metadata writing** — Valid dates before the cutoff year are written into the file along with the generated keywords and any comments extracted from the back. If folder consensus mode is enabled, writes are deferred until all photos in the folder are analyzed — the most common year among high-confidence results is then applied to low-confidence photos (keeping their individual month/day/time) before writing. Low-confidence estimates with no consensus available are added to a `review.html` report. DNG and raw files receive a `.xmp` sidecar instead of direct EXIF modification.
+If you scanned the backs of your prints, place them immediately after the front in filename order (e.g. `img001.jpg` front, `img002.jpg` back). Metadata-AI detects and pairs them automatically.
 
 ---
 
-## Supported Formats
+## How It Works (Photos)
+
+1. **Back-of-photo check.** The next file in filename order is examined with a single combined VLM prompt: is this the back? If yes, what date is written on it? What other text is on it (translated to English)? When Tesseract is installed and the VLM didn't find a date, an OCR pass tries to recover one from machine-readable text.
+2. **IPTC keyword check.** Existing IPTC keywords are scanned for a parseable date — useful when re-running over photos that already have partial metadata.
+3. **VLM image analysis.** One call returns date (if still unknown) + confidence, time of day, scene description, indoor/outdoor, flash fired, location (if `--geotag`), and keywords. The folder name is included as context only when it carries real signal.
+4. **Date validation.** The estimate is checked against a plausible range (1826–2100 for photos), and the time-of-day estimate is normalized to an hour and applied to `DateTimeOriginal`.
+5. **Geotagging.** If enabled, the VLM's location is geocoded via Nominatim. Lookups are rate-limited to 1.1 s and cached.
+6. **Write.** Valid dates below the cutoff year are written via XMP sidecar, then merged into the file with `exiftool -overwrite_original -tagsfromfile=...`. The sidecar is removed after a successful merge. If consensus mode is on, writes are deferred until the whole folder is analyzed.
+
+Low-confidence results with no consensus override are appended to a `review.html` report — one row per photo with folder, filename, the raw VLM guess, confidence, and any extracted comment.
+
+---
+
+## What Gets Written Where
+
+| Field | XMP / EXIF target | Notes |
+| --- | --- | --- |
+| Date | `exif:DateTimeOriginal` | Validated 1826–2100, with estimated hour-of-day |
+| Keywords | `dc:subject` | 5 lowercase tags from VLM, time-of-day words filtered out |
+| Caption | `dc:description` (EXIF `ImageDescription`) | Scene sentence + back-of-photo comment + setting + raw date string |
+| Flash | `exif:Flash` structure with `Fired` field | Proper EXIF tag `0x9209`, readable by Lightroom / Apple Photos / digiKam |
+| GPS | `exif:GPSLatitude` / `GPSLongitude` | Only if `--geotag` resolves to a hit |
+
+There is no standard EXIF tag for "indoor vs outdoor" — that lives in the caption alongside the scene description.
+
+---
+
+## Supported Image Formats
 
 | Format | Metadata method |
-|---|---|
-| `.jpg`, `.jpeg` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
-| `.tiff`, `.tif` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
-| `.png` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
-| `.heic`, `.webp` | XMP sidecar merged into EXIF via ExifTool (sidecar deleted on success) |
-| `.dng` | XMP sidecar file |
-| `.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`, `.raw` | Decoded via rawpy for VLM preview; XMP sidecar file |
+| --- | --- |
+| `.jpg`, `.jpeg` | XMP sidecar merged via ExifTool, sidecar deleted on success |
+| `.tiff`, `.tif` | XMP sidecar merged via ExifTool, sidecar deleted on success |
+| `.png` | XMP sidecar merged via ExifTool, sidecar deleted on success |
+| `.heic`, `.webp` | XMP sidecar merged via ExifTool, sidecar deleted on success |
+| `.dng` | XMP sidecar file (kept) |
+| `.cr2`, `.cr3`, `.nef`, `.arw`, `.raf`, `.orf`, `.rw2`, `.raw` | Decoded via rawpy for VLM preview, XMP sidecar file (kept) |
+
+When ExifTool is missing or the merge fails, the XMP sidecar is kept beside the file as a fallback — Lightroom, Apple Photos, and digiKam will all read it.
 
 ---
 
