@@ -1,5 +1,4 @@
 <img width="600" alt="logo" src="https://github.com/user-attachments/assets/8bcf39fd-93c3-4017-96e0-7d692237b197" />
-# Metadata-AI
 
 Metadata-AI is a local, AI-powered tool that automatically tags and dates scanned physical photographs and home video by writing metadata directly into image EXIF/XMP and video container fields.
 
