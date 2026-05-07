@@ -3,6 +3,7 @@ import io
 import sys
 import base64
 import re
+import shlex
 import time
 import warnings
 import json
@@ -237,19 +238,42 @@ _FOLDER_NOISE_PATTERNS = [
 def is_meaningful_folder_name(name):
     """Return True if the folder name looks like it carries useful context.
 
-    Heuristic: contains a 4-digit year (very common: '1985 Vacation', 'Summer 1992'),
-    OR contains at least 2 alphabetic words and isn't on the noise list.
+    Recognizes:
+      - 4-digit years anywhere ('1985 Vacation', 'Summer 1992')
+      - Short date formats common in scan organization:
+          M-D-YY, MM-DD-YY    e.g. '2-12-87', '08-15-92'
+          M/D/YY, MM/DD/YY    e.g. '2/12/87'
+          M-YY, MM-YY         e.g. '8-79', '12-99'  (M/YY also accepted)
+      - Month name + 2-digit year e.g. 'Aug 87', 'January 92'
+      - Folders with at least 2 alphabetic words ('Paris Trip')
+    Rejects names matching the noise list ('New Folder (2)', 'Scans_Batch_3', etc.).
     """
-    if not name or len(name) < 3:
+    if not name or len(name) < 2:
         return False
     lower = name.lower().strip()
     for pattern in _FOLDER_NOISE_PATTERNS:
         if re.search(pattern, lower):
             return False
-    # Year present? Almost certainly meaningful.
+
+    # 4-digit year present anywhere
     if re.search(r'\b(18|19|20)\d{2}\b', name):
         return True
-    # At least two alphabetic words of >=3 chars?
+
+    # Numeric short-date formats with separators (M-D-YY, M/YY, etc.)
+    # Accepts 1-2 digit month, optional 1-2 digit day, 2 or 4-digit year.
+    if re.search(r'\b\d{1,2}[-/]\d{1,2}([-/]\d{2,4})?\b', name):
+        return True
+
+    # Month name followed by a year (2 or 4-digit), e.g. "Aug 87" or "January 1992"
+    if re.search(
+        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|'
+        r'january|february|march|april|june|july|august|september|october|november|december)'
+        r'[\s.,-]+\d{2,4}\b',
+        lower,
+    ):
+        return True
+
+    # Two or more alphabetic words of >=3 chars (e.g. 'Paris Trip')
     words = [w for w in re.findall(r'[A-Za-z]+', name) if len(w) >= 3]
     return len(words) >= 2
 
@@ -270,7 +294,9 @@ def _apply_metadata_via_exiftool(path, date_str, tags=None, comment=None, raw_da
     Used for JPEG, TIFF, PNG, HEIC, WebP — anything where we don't want to re-encode pixels.
     The XMP sidecar is deleted after a successful merge; kept as a fallback if ExifTool is missing or fails."""
     xmp_path = os.path.splitext(path)[0] + ".xmp"
-    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps, scene, setting, flash)
+    # verbose=False — the XMP is a temp file about to be merged; the user only
+    # sees the final outcome message below (or the warning if it falls back).
+    _apply_metadata_xmp(path, date_str, tags, comment, raw_date, gps, scene, setting, flash, verbose=False)
 
     if shutil.which("exiftool") is None:
         print(f"      ⚠️ ExifTool not found — XMP sidecar kept at {os.path.basename(xmp_path)}")
@@ -298,7 +324,13 @@ def _xml_escape(s):
             .replace("<", "&lt;")
             .replace(">", "&gt;"))
 
-def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, gps=None, scene=None, setting=None, flash=None):
+def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, gps=None, scene=None, setting=None, flash=None, verbose=True):
+    """Write the XMP sidecar for `path`.
+
+    When `verbose=False` the success print is suppressed — used when this function
+    is called as an intermediate step before ExifTool merges the sidecar into the
+    image file (the user only cares about the final outcome, not the temp file).
+    """
     try:
         xmp_path = os.path.splitext(path)[0] + ".xmp"
         keywords_xml = ""
@@ -359,58 +391,392 @@ def _apply_metadata_xmp(path, date_str, tags=None, comment=None, raw_date=None, 
 <?xpacket end='w'?>"""
         with open(xmp_path, "w", encoding="utf-8") as f:
             f.write(xmp_content)
-        print(f"   ✅ Success: {os.path.basename(xmp_path)} written.")
+        if verbose:
+            print(f"   ✅ Success: {os.path.basename(xmp_path)} written.")
     except Exception as e:
         print(f"   ❌ Metadata Error for {os.path.basename(path)}: {e}")
 
 # ---------------------------------------------------------------------------
 # Review queue
+#
+# Two artifacts are produced for low-confidence photos:
+#   - review.json: the canonical record. Each entry carries every field needed
+#                  to re-run a metadata write, plus a status (pending/applied/
+#                  skipped) so the review pass can resume across Ctrl-C.
+#   - review.html: a visual reference with thumbnails. Generated from the JSON.
+#                  Kept in sync after each review decision so the user can
+#                  refresh their browser to see what's left.
+#
+# The review pass itself (run_review_pass) is the decision interface — runs in
+# the terminal, walks pending items, and applies metadata via the same
+# apply_metadata pipeline used by the main run.
 # ---------------------------------------------------------------------------
-def write_review_report(folder, review_queue):
-    """Writes an HTML report of low-confidence photos for manual review.
+def _review_json_path(folder):
+    return os.path.join(folder, "review.json")
 
-    Called once per run — in recursive mode the caller accumulates the queue
-    across all folders and passes the root directory as `folder`.
+def _review_html_path(folder):
+    return os.path.join(folder, "review.html")
+
+def _load_review_json(folder):
+    """Load existing review.json or return None."""
+    path = _review_json_path(folder)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"   ⚠️  Could not read existing review.json: {e}")
+        return None
+
+def _save_review_json(folder, data):
+    """Save review.json atomically (write-then-rename) so a Ctrl-C mid-write
+    doesn't leave a corrupted file."""
+    path = _review_json_path(folder)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"   ⚠️  Could not save review.json: {e}")
+        if os.path.exists(tmp):
+            try: os.remove(tmp)
+            except Exception: pass
+
+def _thumbnail_data_uri(image_path, max_dim=240):
+    """Return a base64 data URI for a small JPEG thumbnail of `image_path`,
+    or None if the image can't be opened. Used to embed thumbnails directly
+    in review.html so the HTML is self-contained and portable."""
+    try:
+        ext = os.path.splitext(image_path)[1].lower()
+        if ext in RAW_EXTENSIONS:
+            try:
+                import rawpy
+                with rawpy.imread(image_path) as raw:
+                    rgb = raw.postprocess(use_camera_wb=True, output_bps=8, half_size=True)
+                img = Image.fromarray(rgb)
+            except ImportError:
+                return None
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                img = Image.open(image_path)
+                img.load()
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        # Use thumbnail() which preserves aspect ratio in place
+        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+def write_review_report(folder, review_queue):
+    """Write review.json + review.html for the given queue.
+
+    `review_queue` is a list of dicts. Each dict is enriched here with a
+    stable id, a status (pending/applied/skipped), and a thumbnail data URI.
+    If a review.json already exists, statuses are merged so previous decisions
+    are preserved across re-runs.
     """
     if not review_queue:
         return
-    report_path = os.path.join(folder, "review.html")
-    rows = ""
-    for item in review_queue:
-        rows += f"""
-        <tr>
-            <td>{_xml_escape(item.get('folder', ''))}</td>
-            <td>{_xml_escape(item['file'])}</td>
-            <td>{_xml_escape(item['raw_guess'])}</td>
-            <td>{item['confidence']}/10</td>
-            <td>{_xml_escape(item.get('comment', '—'))}</td>
-        </tr>"""
+
+    # Merge with any existing decisions on disk (resume support)
+    existing = _load_review_json(folder) or {"items": []}
+    existing_by_path = {item.get("path"): item for item in existing.get("items", [])}
+
+    enriched = []
+    for q in review_queue:
+        path = q.get("path", "")
+        prev = existing_by_path.get(path)
+        # Stable id from the path — survives reordering and re-runs
+        item_id = prev.get("id") if prev else f"item_{abs(hash(path)) % 10**10:010d}"
+        status = prev.get("status") if prev else "pending"
+        decided_date = prev.get("decided_date") if prev else None
+
+        thumb = prev.get("thumb") if prev and prev.get("thumb") else _thumbnail_data_uri(path)
+
+        enriched.append({
+            "id": item_id,
+            "status": status,                       # pending | applied | skipped
+            "decided_date": decided_date,           # set when status=applied
+            "folder": q.get("folder", ""),
+            "file": q.get("file", ""),
+            "path": path,
+            "raw_guess": q.get("raw_guess", ""),
+            "found_date": q.get("found_date", ""),  # the AI's parsed date if any
+            "confidence": q.get("confidence", 0),
+            "comment": q.get("comment", "") or "",
+            # Full metadata record so the review pass can rewrite without re-analyzing
+            "tags": q.get("tags") or "",
+            "raw_date": q.get("raw_date") or "",
+            "gps": q.get("gps"),
+            "scene": q.get("scene") or "",
+            "setting": q.get("setting") or "",
+            "flash": q.get("flash") or "",
+            "thumb": thumb,
+        })
+
+    data = {
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "root": folder,
+        "items": enriched,
+    }
+    _save_review_json(folder, data)
+    _render_review_html(folder, data)
+
+    pending_count = sum(1 for i in enriched if i["status"] == "pending")
+    print(f"\n📋 Review report saved: {_review_html_path(folder)}")
+    if pending_count != len(enriched):
+        print(f"   {pending_count} pending, {len(enriched) - pending_count} previously decided.")
+
+def _render_review_html(folder, data):
+    """Generate the dark-mode HTML view from the review.json data."""
+    items = data.get("items", [])
+    pending = [i for i in items if i["status"] == "pending"]
+    applied = [i for i in items if i["status"] == "applied"]
+    skipped = [i for i in items if i["status"] == "skipped"]
+
+    def card(item):
+        is_done = item["status"] != "pending"
+        status_class = item["status"]
+        status_label = {
+            "pending": "Pending review",
+            "applied": f"Applied: {item.get('decided_date', '')}",
+            "skipped": "Skipped permanently",
+        }[item["status"]]
+
+        thumb_html = (
+            f'<img src="{item["thumb"]}" alt="thumbnail" loading="lazy">'
+            if item.get("thumb")
+            else '<div class="thumb-missing">No preview</div>'
+        )
+
+        comment_html = ""
+        if item.get("comment") and item["comment"] != "—":
+            comment_html = f'<div class="meta-row"><span class="label">Note:</span> <span>{_xml_escape(item["comment"])}</span></div>'
+
+        scene_html = ""
+        if item.get("scene"):
+            scene_html = f'<div class="meta-row scene">{_xml_escape(item["scene"])}</div>'
+
+        return f"""
+    <div class="card {status_class}" data-id="{item['id']}">
+      <div class="thumb">{thumb_html}</div>
+      <div class="body">
+        <div class="filename">{_xml_escape(item['file'])}</div>
+        <div class="folder">{_xml_escape(item.get('folder', ''))}</div>
+        {scene_html}
+        <div class="meta-row"><span class="label">AI guess:</span> <span class="guess">{_xml_escape(item['raw_guess'])}</span></div>
+        <div class="meta-row"><span class="label">Confidence:</span> <span class="conf">{item['confidence']}/10</span></div>
+        {comment_html}
+        <div class="status-pill {status_class}">{_xml_escape(status_label)}</div>
+      </div>
+    </div>"""
+
+    cards_html = "\n".join(card(item) for item in items)
+    generated = data.get("generated", "")
+
     html = f"""<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <title>Metadata-AI — Review Queue</title>
   <style>
-    body {{ font-family: sans-serif; padding: 2em; }}
-    h1 {{ color: #333; }}
-    table {{ border-collapse: collapse; width: 100%; }}
-    th, td {{ border: 1px solid #ccc; padding: 8px 12px; text-align: left; }}
-    th {{ background: #f0f0f0; }}
-    tr:nth-child(even) {{ background: #fafafa; }}
+    :root {{
+      --bg: #0f1115;
+      --panel: #181b22;
+      --panel-2: #1f232c;
+      --border: #2a2f3a;
+      --text: #e6e8ec;
+      --text-dim: #9aa3b2;
+      --accent: #5b9dff;
+      --green: #5dd39e;
+      --amber: #f5a76b;
+      --grey: #6b7280;
+      --shadow: 0 4px 16px rgba(0,0,0,0.35);
+    }}
+    * {{ box-sizing: border-box; }}
+    html, body {{ margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }}
+    body {{ padding: 32px 40px 80px; max-width: 1400px; margin: 0 auto; }}
+    header {{ margin-bottom: 24px; }}
+    h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }}
+    .subtitle {{ color: var(--text-dim); font-size: 14px; }}
+    .stats {{ display: flex; gap: 16px; margin: 20px 0 28px; flex-wrap: wrap; }}
+    .stat {{ background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 18px; min-width: 110px; }}
+    .stat .num {{ font-size: 22px; font-weight: 600; }}
+    .stat .lbl {{ font-size: 12px; color: var(--text-dim); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.04em; }}
+    .stat.pending .num {{ color: var(--amber); }}
+    .stat.applied .num {{ color: var(--green); }}
+    .stat.skipped .num {{ color: var(--grey); }}
+
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }}
+    .card {{ background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; box-shadow: var(--shadow); display: flex; flex-direction: column; transition: opacity 0.2s, border-color 0.2s; }}
+    .card.applied {{ opacity: 0.55; border-color: rgba(93, 211, 158, 0.25); }}
+    .card.skipped {{ opacity: 0.45; border-color: rgba(107, 114, 128, 0.25); }}
+    .thumb {{ background: var(--panel-2); aspect-ratio: 4 / 3; display: flex; align-items: center; justify-content: center; overflow: hidden; }}
+    .thumb img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+    .thumb-missing {{ color: var(--text-dim); font-size: 13px; }}
+    .body {{ padding: 14px 16px 16px; flex: 1; display: flex; flex-direction: column; gap: 6px; }}
+    .filename {{ font-size: 14px; font-weight: 600; word-break: break-all; }}
+    .folder {{ font-size: 12px; color: var(--text-dim); margin-bottom: 6px; }}
+    .scene {{ font-size: 13px; color: var(--text-dim); font-style: italic; line-height: 1.4; padding-bottom: 4px; }}
+    .meta-row {{ font-size: 13px; line-height: 1.5; }}
+    .meta-row .label {{ color: var(--text-dim); }}
+    .meta-row .guess {{ font-family: ui-monospace, "SF Mono", Menlo, monospace; }}
+    .meta-row .conf {{ font-weight: 600; color: var(--amber); }}
+    .status-pill {{ display: inline-block; align-self: flex-start; margin-top: 8px; padding: 3px 10px; border-radius: 999px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }}
+    .status-pill.pending {{ background: rgba(245, 167, 107, 0.15); color: var(--amber); border: 1px solid rgba(245, 167, 107, 0.3); }}
+    .status-pill.applied {{ background: rgba(93, 211, 158, 0.15); color: var(--green); border: 1px solid rgba(93, 211, 158, 0.3); }}
+    .status-pill.skipped {{ background: rgba(107, 114, 128, 0.15); color: var(--text-dim); border: 1px solid rgba(107, 114, 128, 0.3); }}
+
+    .help {{ background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; margin-bottom: 24px; font-size: 13px; color: var(--text-dim); line-height: 1.6; }}
+    .help code {{ background: var(--panel-2); padding: 2px 6px; border-radius: 4px; color: var(--text); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }}
+
+    @media (max-width: 600px) {{
+      body {{ padding: 20px 16px 60px; }}
+      .grid {{ grid-template-columns: 1fr; }}
+    }}
   </style>
 </head>
 <body>
-  <h1>📋 Metadata-AI — Manual Review Queue</h1>
-  <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {len(review_queue)} photo(s) need review.</p>
-  <table>
-    <thead><tr><th>Folder</th><th>File</th><th>VLM Date Guess</th><th>Confidence</th><th>Comment</th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table>
+  <header>
+    <h1>Metadata-AI — Review Queue</h1>
+    <div class="subtitle">Generated {_xml_escape(generated)}</div>
+  </header>
+
+  <div class="stats">
+    <div class="stat pending"><div class="num">{len(pending)}</div><div class="lbl">Pending</div></div>
+    <div class="stat applied"><div class="num">{len(applied)}</div><div class="lbl">Applied</div></div>
+    <div class="stat skipped"><div class="num">{len(skipped)}</div><div class="lbl">Skipped</div></div>
+  </div>
+
+  <div class="help">
+    Run <code>python metadata-ai.py {_xml_escape(shlex.quote(folder))} --review</code> in your terminal to step through pending items.
+    Refresh this page to see updated statuses after decisions are applied.
+  </div>
+
+  <div class="grid">{cards_html}
+  </div>
 </body>
 </html>"""
-    with open(report_path, "w", encoding="utf-8") as f:
+
+    with open(_review_html_path(folder), "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"\n📋 Review report saved: {report_path}")
+
+
+# ---------------------------------------------------------------------------
+# Interactive review pass
+# ---------------------------------------------------------------------------
+def run_review_pass(folder, xmp_only=False):
+    """Walk pending items in review.json and prompt the user for a decision.
+
+    Decisions: [a]ccept the AI's date, [e]dit the date, [s]kip permanently, [q]uit.
+    Each decision is persisted before moving on, so Ctrl-C is safe.
+    On accept/edit, metadata is written via apply_metadata using the full
+    record stored in review.json (no re-analysis needed).
+    """
+    data = _load_review_json(folder)
+    if not data or not data.get("items"):
+        print("No review.json found in this folder — nothing to review.")
+        return
+
+    items = data["items"]
+    pending = [i for i in items if i["status"] == "pending"]
+    if not pending:
+        print(f"All {len(items)} item(s) in review.json have already been decided.")
+        return
+
+    total = len(pending)
+    print(f"\n{'─'*60}")
+    print(f"📋 Interactive review — {total} pending photo(s)")
+    print(f"{'─'*60}")
+    print("For each photo, choose:")
+    print("  [a] accept the AI's date and write metadata")
+    print("  [e] enter a different date and write metadata")
+    print("  [s] skip permanently (no metadata written)")
+    print("  [q] quit (decisions so far are kept; resume with --review)")
+    print(f"{'─'*60}\n")
+
+    decided_count = 0
+    for idx, item in enumerate(pending, 1):
+        print(f"\n[{idx}/{total}] {item.get('folder', '')}/{item['file']}")
+        print(f"  Path:       {item['path']}")
+        if item.get("scene"):
+            print(f"  Scene:      {item['scene']}")
+        print(f"  AI guess:   {item['raw_guess']}  ({item['confidence']}/10 confidence)")
+        if item.get("comment") and item["comment"] not in ("—", ""):
+            print(f"  Note:       {item['comment']}")
+
+        while True:
+            choice = input("  Decision [a/e/s/q]: ").strip().lower()
+            if choice in ("a", "e", "s", "q"):
+                break
+            print("  Please enter a, e, s, or q.")
+
+        if choice == "q":
+            print(f"\n   Quitting. {decided_count}/{total} decided this session.")
+            print(f"   Run with --review to resume.")
+            return
+
+        if choice == "s":
+            item["status"] = "skipped"
+            _save_review_json(folder, data)
+            _render_review_html(folder, data)
+            print(f"  → Skipped permanently.")
+            decided_count += 1
+            continue
+
+        if choice == "a":
+            date_to_write = item.get("found_date") or item["raw_guess"]
+            # If we only have a fuzzy guess, run it through parse_fuzzy_date now
+            if not re.match(r'^\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2}$', date_to_write):
+                parsed, _ = parse_fuzzy_date(date_to_write)
+                if not parsed:
+                    print(f"  ⚠️  Could not parse '{date_to_write}' as a date — please use [e] to enter one manually.")
+                    continue
+                date_to_write = parsed
+        else:  # choice == "e"
+            user_date = input("  Enter date (YYYY:MM:DD or YYYY or '1985' or 'circa 1970s'): ").strip()
+            if not user_date:
+                print("  ⚠️  Empty input — leaving as pending.")
+                continue
+            parsed, _ = parse_fuzzy_date(user_date)
+            if not parsed:
+                print(f"  ⚠️  Could not parse '{user_date}' as a date — leaving as pending.")
+                continue
+            date_to_write = parsed
+
+        # Write metadata using the full record from review.json
+        try:
+            gps = tuple(item["gps"]) if item.get("gps") else None
+            apply_metadata(
+                item["path"], date_to_write,
+                tags=item.get("tags") or None,
+                comment=item.get("comment") if item.get("comment") not in ("—", "") else None,
+                raw_date=item.get("raw_date") or None,
+                gps=gps,
+                xmp_only=xmp_only,
+                scene=item.get("scene") or None,
+                setting=item.get("setting") or None,
+                flash=item.get("flash") or None,
+            )
+            item["status"] = "applied"
+            item["decided_date"] = date_to_write
+            _save_review_json(folder, data)
+            _render_review_html(folder, data)
+            decided_count += 1
+        except Exception as e:
+            print(f"  ❌ Write failed: {e} — leaving as pending.")
+
+    print(f"\n{'─'*60}")
+    remaining = sum(1 for i in items if i["status"] == "pending")
+    print(f"✅ Review complete: {decided_count} decided this session, {remaining} still pending.")
+    print(f"   View: {_review_html_path(folder)}")
+    print(f"{'─'*60}")
 
 # ---------------------------------------------------------------------------
 # Geotagging
@@ -491,7 +857,15 @@ def _clean_vlm_field(s):
     return re.sub(r'[*_`#]', '', s).strip() if s else s
 
 def _parse_time_of_day(text):
-    """Converts a natural language time estimate to an hour (0-23). Returns 12 if unparseable."""
+    """Convert a natural language time estimate to an hour (0-23).
+
+    Returns None when the input contains no recognizable time signal — the
+    caller decides what default to use. Keeping "couldn't parse" distinct
+    from "noon" lets us tell the difference between an explicit midday photo
+    and one where we just don't know.
+    """
+    if not text:
+        return None
     text = text.lower().strip()
     # Specific time like "3pm", "10am", "14:00", "3:30pm".
     # The minutes group is optional — fixes a bug where bare "3pm" required a colon.
@@ -504,7 +878,7 @@ def _parse_time_of_day(text):
         elif ampm == 'am' and hour == 12:
             hour = 0
         return min(hour, 23)
-    # 24-hour clock like "14:00" or just "14"
+    # 24-hour clock like "14:00"
     m = re.search(r'\b(\d{1,2}):(\d{2})\b', text)
     if m:
         hour = int(m.group(1))
@@ -526,7 +900,7 @@ def _parse_time_of_day(text):
         return 9
     if 'night' in text:
         return 21
-    return 12  # default noon
+    return None  # nothing parseable — caller falls back to noon
 
 def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, global_offset=0, global_total=None, folder_consensus=False, root_folder=None, dry_run=False, skip_dated=False, review_queue_accumulator=None):
     """Process one folder of photos.
@@ -676,8 +1050,11 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             else:
                 print(f"      No IPTC keywords found.")
 
-        # Step 3: Single VLM call — date (if unknown), time, scene, setting, flash,
-        # location (if geotagging enabled), and keywords.
+        # Step 3: VLM analysis. Internally this is two focused calls when needed:
+        # a date-only call (only when no date was found from back-of-photo or IPTC)
+        # followed by a description call. Combining the two tasks measurably hurt
+        # confidence calibration, so they're separated. From the user's point of
+        # view this is one "analyze the image" step — the calls aren't surfaced.
         raw_time = None
         vlm_scene = None
         vlm_setting = None
@@ -685,37 +1062,76 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         tags_resp = None
         geo_resp_inline = None
 
-        print(f"   3) Asking VLM to analyze image...")
-
-        geo_instruction = (
-            "LOCATION: <specific city, region, or landmark if clearly identifiable — otherwise 'none'>\n"
-        ) if enable_geo else ""
-
         # Only inject the folder name as VLM context when it looks meaningful —
         # noise like "New Folder (2)" or "Scans_Batch_3" otherwise primes the
         # model with garbage.
         folder_hint_date = (
-            f"The folder containing this photo is named '{folder_name}' — treat this as high-confidence information for the date and location. "
+            f"The folder containing this photo is named '{folder_name}' — treat this as high-confidence information for the date. "
             if folder_name_useful else ""
         )
         folder_hint_loc = (
-            f"The folder containing this photo is named '{folder_name}' — treat this as high-confidence information for the location.\n"
+            f"The folder containing this photo is named '{folder_name}' — treat this as high-confidence information for the location. "
             if folder_name_useful else ""
         )
 
-        date_instruction = (
-            "Analyze the fashion, hairstyles, technology, and setting in this photo. "
-            f"{folder_hint_date}"
-            "Estimate the date as specifically as possible — could be YYYY:MM, YYYY, a decade like '1970s', or 'circa 1965'. "
-            f"The date must be before {cutoff_year}. "
-            "Also provide a confidence score from 1-10 for your date estimate.\n"
-            "DATE: <your estimate>\n"
-            "CONFIDENCE: <score>\n"
-        ) if not found_date else folder_hint_loc
+        print(f"   3) Analyzing image...")
 
-        full_prompt = (
-            f"{date_instruction}"
-            "Also answer the following:\n"
+        # Internal date call — focused single-task prompt for date estimation.
+        # Skipped when a date was already extracted from back-of-photo or IPTC.
+        if not found_date:
+            date_prompt = (
+                "Analyze the fashion, hairstyles, technology, and setting in this photo to estimate when it was taken. "
+                f"{folder_hint_date}"
+                "Estimate the date as specifically as possible — could be YYYY:MM:DD, YYYY:MM, YYYY, "
+                "a decade like '1970s', or 'circa 1965'. "
+                f"The date must be before {cutoff_year}. "
+                "Also provide a confidence score from 1-10 for your date estimate.\n"
+                "Reply in EXACTLY this format with no other text:\n"
+                "DATE: <your estimate>\n"
+                "CONFIDENCE: <score 1-10>"
+            )
+            date_resp = ask_vlm(current_path, date_prompt, max_tokens=200)
+            if not date_resp:
+                print(f"      ⚠️ VLM returned no response for date estimate.")
+                date_resp = ""
+
+            date_line = re.search(r'DATE:\s*([^\n]+)',    date_resp)
+            conf_line = re.search(r'CONFIDENCE:\s*(\d+)', date_resp)
+
+            if date_line:
+                raw_guess = date_line.group(1).strip()
+                confidence = int(conf_line.group(1)) if conf_line else 5
+                found_date, raw_date_text = parse_fuzzy_date(raw_guess)
+                if found_date:
+                    # Validate year, month, and day are in plausible range
+                    parts = found_date.split(':')
+                    try:
+                        year_val = int(parts[0])
+                        month_val = int(parts[1])
+                        day_val = int(parts[2].split()[0])
+                        if not (MIN_PHOTO_YEAR <= year_val <= MAX_YEAR and 1 <= month_val <= 12 and 1 <= day_val <= 31):
+                            print(f"      Invalid date from VLM ('{raw_guess}') — discarding.")
+                            found_date = None
+                        else:
+                            print(f"      Date:       {found_date} (confidence: {confidence}/10)" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
+                    except (IndexError, ValueError):
+                        print(f"      Invalid date format ('{raw_guess}') — discarding.")
+                        found_date = None
+                else:
+                    print(f"      VLM could not determine a date. Raw response: '{raw_guess}' (confidence: {confidence}/10)")
+
+        # Internal description call — time, scene, setting, flash, location, keywords.
+        geo_instruction = (
+            "LOCATION: <specific city, region, or landmark if clearly identifiable — otherwise 'none'>\n"
+        ) if enable_geo else ""
+
+        # Folder-name location hint is only added in the description call when
+        # geotagging is on — the date call already used it for date inference.
+        location_context = folder_hint_loc if enable_geo else ""
+
+        desc_prompt = (
+            f"{location_context}"
+            "Describe this photo. Reply in EXACTLY this format with no other text:\n"
             "TIME: <time of day — e.g. 'morning', 'midday', 'afternoon', 'evening', or '3pm'>\n"
             "SCENE: <one sentence describing the scene>\n"
             "SETTING: <'indoor' or 'outdoor'>\n"
@@ -724,14 +1140,12 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             "KEYWORDS: <5 descriptive keywords, comma separated>"
         )
 
-        resp = ask_vlm(current_path, full_prompt)
+        resp = ask_vlm(current_path, desc_prompt)
         if not resp:
-            print(f"      ⚠️ VLM returned no response — skipping analysis.")
+            print(f"      ⚠️ VLM returned no response — skipping description.")
             resp = ""  # ensure regex calls below get an empty string, not None
 
-        # Parse all fields from the single response
-        date_line    = re.search(r'DATE:\s*([^\n]+)',       resp)
-        conf_line    = re.search(r'CONFIDENCE:\s*(\d+)',    resp)
+        # Parse description fields from the response
         time_line    = re.search(r'TIME:\s*([^\n]+)',       resp)
         scene_line   = re.search(r'SCENE:\s*([^\n]+)',      resp)
         setting_line = re.search(r'SETTING:\s*([^\n]+)',    resp)
@@ -739,36 +1153,15 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         geo_line     = re.search(r'LOCATION:\s*([^\n]+)',   resp) if enable_geo else None
         keywords_line = re.search(r'KEYWORDS:\s*([^\n]+)',  resp)
 
-        if not found_date and date_line:
-            raw_guess = date_line.group(1).strip()
-            confidence = int(conf_line.group(1)) if conf_line else 5
-            found_date, raw_date_text = parse_fuzzy_date(raw_guess)
-            if found_date:
-                # Validate year, month, and day are in plausible range
-                parts = found_date.split(':')
-                try:
-                    year_val = int(parts[0])
-                    month_val = int(parts[1])
-                    day_val = int(parts[2].split()[0])
-                    if not (MIN_PHOTO_YEAR <= year_val <= MAX_YEAR and 1 <= month_val <= 12 and 1 <= day_val <= 31):
-                        print(f"      Invalid date from VLM ('{raw_guess}') — discarding.")
-                        found_date = None
-                    else:
-                        print(f"      Date:       {found_date} (confidence: {confidence}/10)" + (f" — fuzzy: {raw_date_text}" if raw_date_text else ""))
-                except (IndexError, ValueError):
-                    print(f"      Invalid date format ('{raw_guess}') — discarding.")
-                    found_date = None
-            else:
-                print(f"      VLM could not determine a date. Raw response: '{raw_guess}' (confidence: {confidence}/10)")
-
+        # Parse the time field first, then use the parse result as the validity signal.
+        # This is more robust than denylisting phrases like "studio lighting" — if the
+        # VLM returned "early morning, around 7am" (>40 chars, used to be discarded),
+        # the parser still finds 7am. If it returned a hedge like "cannot determine
+        # from indoor lighting", the parser finds nothing and the caller falls back.
         _raw_time_str = _clean_vlm_field(time_line.group(1)) if time_line else None
-        # If the VLM returned a long explanation instead of a simple time value, discard it
-        raw_time = _raw_time_str if _raw_time_str and len(_raw_time_str) < 40 and not any(
-            w in _raw_time_str.lower() for w in [
-                "not applicable", "cannot", "studio", "artificial", "controlled",
-                "indoor lighting", "specific time", "unable", "n/a", "unknown"
-            ]
-        ) else None
+        time_hour = _parse_time_of_day(_raw_time_str)
+        raw_time = _raw_time_str if time_hour is not None else None
+
         vlm_scene   = _clean_vlm_field(scene_line.group(1))        if scene_line   else None
         _raw_setting = _clean_vlm_field(setting_line.group(1)) if setting_line else None
         _raw_flash   = _clean_vlm_field(flash_line.group(1)).lower() if flash_line else None
@@ -799,10 +1192,11 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
         if vlm_flash:   print(f"      Flash:      {vlm_flash}")
         if tags_resp:   print(f"      Keywords:   {tags_resp}")
 
-        # Apply estimated time of day to the date string
-        time_hour = _parse_time_of_day(raw_time) if raw_time else 12
+        # Apply estimated time of day to the date string. time_hour was computed
+        # above when we parsed the raw time field; default to noon if nothing parseable.
         if found_date:
-            found_date = found_date[:11] + f"{time_hour:02d}:00:00"
+            applied_hour = time_hour if time_hour is not None else 12
+            found_date = found_date[:11] + f"{applied_hour:02d}:00:00"
             print(f"      Timestamp:  {found_date}" + (f" (~{raw_time})" if raw_time else ""))
 
         # Step 4: Geotagging — use inline location from VLM if available, else folder hint
@@ -841,14 +1235,9 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
             else:
                 print(f"      No location identified.")
 
-        # Step 5: Keywords already generated in step 3 — just confirm or skip
-        if tags_resp:
-            print(f"   5) Keywords from VLM analysis: {tags_resp}")
-        else:
-            print(f"   5) No keywords returned by VLM.")
-
-        # Step 6: Write metadata (deferred if folder_consensus is on)
-        print(f"   6) Writing metadata...")
+        # Step 5: Write metadata (deferred if folder_consensus is on).
+        # Keywords were already shown in step 3b — no need for a separate "confirm" step.
+        print(f"   5) Writing metadata...")
         if found_date:
             try:
                 year = int(found_date[:4])
@@ -883,9 +1272,17 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                             review_queue.append({
                                 "folder": folder_name,
                                 "file": current_file,
+                                "path": current_path,
                                 "raw_guess": raw_date_text or found_date,
+                                "found_date": found_date,
                                 "confidence": confidence,
-                                "comment": found_comment or "—"
+                                "comment": found_comment or "—",
+                                "tags": tags_resp,
+                                "raw_date": raw_date_text,
+                                "gps": list(gps_coords) if gps_coords else None,
+                                "scene": vlm_scene,
+                                "setting": vlm_setting,
+                                "flash": vlm_flash,
                             })
                 else:
                     print(f"      ⏭️  Skipping: date {year} is {cutoff_year} or later.")
@@ -930,9 +1327,17 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 review_queue.append({
                     "folder": folder_name,
                     "file": r['file'],
+                    "path": r['path'],
                     "raw_guess": r['raw_date'] or date,
+                    "found_date": date,
                     "confidence": r['confidence'],
-                    "comment": r['comment'] or "—"
+                    "comment": r['comment'] or "—",
+                    "tags": r.get('tags'),
+                    "raw_date": r.get('raw_date'),
+                    "gps": list(r['gps']) if r.get('gps') else None,
+                    "scene": r.get('scene'),
+                    "setting": r.get('setting'),
+                    "flash": r.get('flash'),
                 })
 
     # Either accumulate into the caller's shared queue (recursive mode), or
@@ -963,9 +1368,12 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
 
 
 def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False, recursive=False, folder_consensus=False, dry_run=False, skip_dated=False):
+    """Process a directory of photos. Returns the folder where review.json was
+    written (or None if no review queue was produced), so the caller can offer
+    an interactive review pass at end of run."""
     if not os.path.exists(folder):
         print(f"Directory {folder} not found.")
-        return
+        return None
 
     if recursive:
         all_paths = []
@@ -996,12 +1404,14 @@ def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=F
 
         if not dry_run:
             _clear_checkpoint(folder)
-        return
+        return folder if accumulated_review_queue else None
 
     files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(EXTENSIONS)])
     _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, folder_consensus=folder_consensus, dry_run=dry_run, skip_dated=skip_dated)
     if not dry_run:
         _clear_checkpoint(folder)
+    # Return the folder if a review.json was written (i.e. there were skipped items)
+    return folder if os.path.exists(_review_json_path(folder)) else None
 
 
 # ---------------------------------------------------------------------------
@@ -1441,10 +1851,10 @@ if __name__ == "__main__":
                         help="Analyze photos and print what would be written without modifying any files")
     parser.add_argument("--skip-dated", action="store_true", default=False,
                         help="Skip photos that already have a DateTimeOriginal tag written")
+    parser.add_argument("--review", action="store_true", default=False,
+                        help="Run interactive review of pending items in <directory>/review.json (skips photo analysis)")
     parser.add_argument("--model", type=str, default=None,
                         help=f"LM Studio model ID to use (default: {MODEL_ID})")
-    parser.add_argument("--video", type=str, default=None,
-                        help="Path to a video file to analyze (skips photo processing)")
     parser.add_argument("--video-interval", type=int, default=None, metavar="SECONDS",
                         help="Seconds between frames for video analysis (default: 30)")
     parser.add_argument("--output", type=str, default=None,
@@ -1463,6 +1873,17 @@ if __name__ == "__main__":
     else:
         raw = input(f"Enter directory or file path [{DIRECTORY}]: ").strip()
         input_path = re.sub(r'\\(.)', r'\1', raw) or DIRECTORY
+
+    # ── Review-only mode ────────────────────────────────────────────────────
+    # Walk pending items in an existing review.json without re-analyzing photos.
+    if args.review:
+        if not os.path.isdir(input_path):
+            print(f"--review expects a directory containing review.json. Got: {input_path}")
+            sys.exit(1)
+        # xmp_only flag still affects the write path during review
+        xmp_only = args.xmp_only or False
+        run_review_pass(input_path, xmp_only=xmp_only)
+        sys.exit(0)
 
     # If a file path was given, route directly to the right processor
     if os.path.isfile(input_path):
@@ -1496,15 +1917,6 @@ if __name__ == "__main__":
         sys.exit(0)
 
     directory = input_path
-
-    # ── Video mode — check early so no photo prompts are shown ───────────────
-    if args.video:
-        # Fully CLI-driven: resolve output path from --output if provided
-        video_path = re.sub(r'\\(.)', r'\1', args.video.strip())
-        interval = args.video_interval if args.video_interval is not None else 30
-        output_path = getattr(args, 'output', None)
-        process_video(video_path, interval, output_path=output_path)
-        sys.exit(0)
 
     # ── Photo or video mode selection ─────────────────────────────────────────
     analyze_video = input("Analyze video files in this directory? [y/N]: ").strip().lower() == "y"
@@ -1591,4 +2003,16 @@ if __name__ == "__main__":
             else:
                 print("   Resuming previous session.\n")
 
-    process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo, recursive, folder_consensus, dry_run=args.dry_run, skip_dated=args.skip_dated)
+    review_folder = process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo, recursive, folder_consensus, dry_run=args.dry_run, skip_dated=args.skip_dated)
+
+    # End-of-run review prompt — only when there are pending items and we're not in dry-run mode.
+    if review_folder and not args.dry_run:
+        data = _load_review_json(review_folder)
+        if data:
+            pending_count = sum(1 for i in data.get("items", []) if i.get("status") == "pending")
+            if pending_count:
+                ans = input(f"\n📋 {pending_count} photo(s) need review. Run interactive review now? [y/N]: ").strip().lower()
+                if ans == "y":
+                    run_review_pass(review_folder, xmp_only=xmp_only)
+                else:
+                    print(f"   Skipping. You can run it later with: python metadata-ai.py {shlex.quote(review_folder)} --review")
