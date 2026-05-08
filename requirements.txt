@@ -1,11 +1,19 @@
+# Core requirements
+Pillow>=10.0.0
+iptcinfo3
 natsort
 openai
-Pillow
 pillow-heif
-geopy
-iptcinfo3
-rawpy
-numpy
+rich
 
-# Optional — enables OCR on backs of photos for handwritten date extraction
+# Optional — interactive arrow-key prompts (falls back to plain text prompts without it)
+questionary
+
+# Optional — geotagging via Nominatim (only needed with --geotag)
+geopy
+
+# Optional — raw camera format support: Canon CR2/CR3, Nikon NEF, Sony ARW, Fuji RAF, Olympus ORF, Panasonic RW2
+# rawpy
+
+# Optional — extra OCR pass on backs of photos (VLM handles this without it)
 # pytesseract
