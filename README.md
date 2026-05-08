@@ -113,4 +113,4 @@ XMP sidecar files are read by Lightroom, Apple Photos, digiKam, and most photo m
 
 ## License
 
-GNU General Public License v3 (GPLv3)
+MIT
