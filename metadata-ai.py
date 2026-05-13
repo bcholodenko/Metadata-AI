@@ -3,20 +3,24 @@ import io
 import sys
 import base64
 import re
-import shlex
 import time
 import warnings
 import json
 import shutil
 import subprocess
 import tempfile
-import textwrap
 from itertools import groupby
 from pathlib import Path
 from collections import Counter, deque
+from dataclasses import dataclass, field
+from typing import Optional
 
-# Force line-buffered output so progress prints appear immediately in the terminal
-sys.stdout.reconfigure(line_buffering=True)
+# Force line-buffered output so progress prints appear immediately in the terminal.
+# reconfigure() is not available on all platforms/builds; fail silently if so.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except (AttributeError, io.UnsupportedOperation):
+    pass
 import logging
 from datetime import datetime
 from natsort import natsorted
@@ -42,6 +46,30 @@ logging.getLogger('iptcinfo').setLevel(logging.ERROR)
 register_heif_opener()
 
 console = Console()
+
+def _quote_path(p: str) -> str:
+    """Return a shell-displayable version of p for use in hint messages.
+
+    shlex.quote uses single-quotes which work in bash/zsh but not cmd.exe or
+    PowerShell.  On Windows we wrap in double-quotes instead.  This is only
+    used in printed strings shown to the user — never passed to subprocess.
+    """
+    import platform
+    if platform.system() == "Windows":
+        # Double-quote; escape any pre-existing double-quotes in the path.
+        return '"' + p.replace('"', '\\"') + '"'
+    import shlex
+    return shlex.quote(p)
+
+
+def _resolve_binary(name: str) -> str:
+    """Return the full path to a required external binary, or just the name
+    if shutil.which can't find it (subprocess will raise a clear error later).
+
+    On Windows, shutil.which() searches for name, name.exe, name.cmd, etc.,
+    so this works correctly without any special-casing.
+    """
+    return shutil.which(name) or name
 
 def _yn(prompt: str, default_yes: bool = False) -> bool:
     """Styled y/n prompt. Falls back cleanly if stdin is not a tty."""
@@ -340,7 +368,7 @@ def is_meaningful_folder_name(name):
       - 4-digit years anywhere ('Christmas 1978', 'Summer Vacation 1965')
       - Short date formats common in scan organization:
           M-D-YY, MM-DD-YY    e.g. '6-14-82', '08-15-92'
-          M/D/YY, MM/DD/YY    e.g. '2/12/87'
+          M/D/YY, MM/DD/YY    e.g. '1/12/96'
           M-YY, MM-YY         e.g. '8-79', '12-99'  (M/YY also accepted)
       - Month name + 2-digit year e.g. 'Aug 87', 'January 92'
       - Folders with at least 2 alphabetic words ('Paris Trip')
@@ -402,7 +430,7 @@ def _apply_metadata_via_exiftool(path, date_str, tags=None, comment=None, raw_da
 
     try:
         result = subprocess.run(
-            ["exiftool", "-overwrite_original", f"-tagsfromfile={xmp_path}", path],
+            [_resolve_binary("exiftool"), "-overwrite_original", f"-tagsfromfile={xmp_path}", path],
             capture_output=True, text=True
         )
         if result.returncode == 0:
@@ -753,7 +781,7 @@ def _render_review_html(folder, data):
   </div>
 
   <div class="help">
-    Run <code>python metadata-ai.py {_xml_escape(shlex.quote(folder))} --review</code> in your terminal to step through pending items.
+    Run <code>python metadata-ai.py {_xml_escape(_quote_path(folder))} --review</code> in your terminal to step through pending items.
     Refresh this page to see updated statuses after decisions are applied.
   </div>
 
@@ -842,7 +870,7 @@ def run_review_pass(folder, xmp_only=False):
 
         if choice == "q":
             console.print(f"\n[dim]Quitting. {decided_count}/{total} decided this session.[/dim]")
-            console.print(f"[dim]Resume with:[/dim] [cyan]python metadata-ai.py {shlex.quote(folder)} --review[/cyan]")
+            console.print(f"[dim]Resume with:[/dim] [cyan]python metadata-ai.py {_quote_path(folder)} --review[/cyan]")
             return
 
         if choice == "s":
@@ -924,7 +952,7 @@ def geolocate(location_text):
         from geopy.geocoders import Nominatim
         # Nominatim asks for a contact-identifying user agent. If you fork this,
         # replace the URL/email with your own.
-        geolocator = Nominatim(user_agent="metadata-ai/1.0 (https://github.com/yourname/metadata-ai)")
+        geolocator = Nominatim(user_agent="metadata-ai/1.0 (https://github.com/bcholodenko/Metadata-AI)")
 
         # Honour the rate limit
         elapsed = time.monotonic() - _LAST_GEOCODE_TIME
@@ -953,7 +981,7 @@ def _has_existing_date(path):
         return False
     try:
         result = subprocess.run(
-            ["exiftool", "-DateTimeOriginal", "-s3", path],
+            [_resolve_binary("exiftool"), "-DateTimeOriginal", "-s3", path],
             capture_output=True, text=True
         )
         return bool(result.stdout.strip())
@@ -966,12 +994,12 @@ def _checkpoint_path(root_folder):
 def _load_checkpoint(root_folder):
     path = _checkpoint_path(root_folder)
     if os.path.exists(path):
-        with open(path, 'r') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             return set(line.strip() for line in f if line.strip())
     return set()
 
 def _save_checkpoint(root_folder, completed_path):
-    with open(_checkpoint_path(root_folder), 'a') as f:
+    with open(_checkpoint_path(root_folder), 'a', encoding='utf-8') as f:
         f.write(completed_path + '\n')
 
 def _clear_checkpoint(root_folder):
@@ -1029,7 +1057,408 @@ def _parse_time_of_day(text):
         return 21
     return None  # nothing parseable — caller falls back to noon
 
-def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, global_offset=0, global_total=None, folder_consensus=False, root_folder=None, dry_run=False, skip_dated=False, review_queue_accumulator=None, shared_durations=None, batch_totals=None):
+@dataclass
+class PhotoAnalysis:
+    """Bundles everything we extract about one photo before deciding what to write.
+
+    Most of these come from the VLM. Each field is independently optional —
+    a photo with a clear date from the back but no VLM description still gets
+    a valid PhotoAnalysis, just with most fields as None.
+    """
+    found_date:    Optional[str] = None  # EXIF format "YYYY:MM:DD HH:MM:SS"
+    raw_date_text: Optional[str] = None  # original fuzzy string ("1970s") for sidecar
+    confidence:    int = 10              # date confidence 1-10 (10 = from back/IPTC)
+    comment:       Optional[str] = None  # text written on back of photo
+    scene:         Optional[str] = None  # one-sentence VLM description
+    setting:       Optional[str] = None  # "indoor" or "outdoor"
+    flash:         Optional[str] = None  # "yes" or "no"
+    tags:          Optional[str] = None  # comma-separated keywords
+    gps:           Optional[tuple] = None  # (lat, lon) or None
+    time_hour:     Optional[int] = None  # 0-23 if VLM gave a parseable time
+
+
+def _try_back_of_photo(folder, files, i, processed_files):
+    """Phase 1: Check whether files[i+1] is the back of files[i].
+
+    Returns (found_date, raw_date_text, comment). All three are None if there's
+    no next file, the next file isn't a back, or no date/comment is found.
+    On a confirmed back, the next file is added to processed_files so the
+    main loop skips it.
+    """
+    console.print(f"   [dim]1) Back-of-photo check…[/dim]")
+    if i + 1 >= len(files):
+        console.print(f"      [dim]No next image to check.[/dim]")
+        return None, None, None
+
+    next_file = files[i + 1]
+    next_path = os.path.join(folder, next_file)
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _test = Image.open(next_path)
+            _test.load()
+            _test.close()
+    except Exception:
+        console.print(f"      [yellow]⚠ Could not open {next_file} — skipping back check.[/yellow]")
+        return None, None, None
+
+    # Single VLM call: detect back + extract date + extract comment at once
+    back_prompt = (
+        "Look very carefully at this image. "
+        "First determine: is this the BACK (reverse side) of a physical printed photograph? "
+        "The back shows blank paper, handwriting, stamps, photo lab printing, or a plain surface — no photographic scene. "
+        "Reply in this exact format:\n"
+        "IS_BACK: <yes or no>\n"
+        "DATE: <any date written on it in YYYY:MM:DD format, or 'circa 1950s', or 'none'>\n"
+        "COMMENT: <any other handwritten or printed text excluding dates, translated to English, or 'none'>"
+    )
+    back_resp = ask_vlm(next_path, back_prompt)
+    is_back_line = re.search(r'IS_BACK:\s*([^\n]+)', back_resp or "")
+    if not (is_back_line and is_back_line.group(1).strip().lower().startswith("yes")):
+        console.print(f"      [dim]No back detected.[/dim]")
+        return None, None, None
+
+    console.print(f"      [green]Back confirmed:[/green] {next_file}")
+    processed_files.add(next_file)
+
+    date_match    = re.search(r'DATE:\s*([^\n]+)',    back_resp)
+    comment_match = re.search(r'COMMENT:\s*([^\n]+)', back_resp)
+    raw_date_str  = date_match.group(1).strip()    if date_match    else "none"
+    raw_comment   = comment_match.group(1).strip() if comment_match else "none"
+
+    # If VLM didn't find a date but Tesseract is available, try OCR as a backup
+    ocr_context = run_tesseract(next_path)
+    if ocr_context and raw_date_str.lower() == "none":
+        console.print(f"      [dim]Tesseract OCR found text — re-checking for date…[/dim]")
+        ocr_prompt = (
+            f"This is the back of a photo. OCR extracted: {ocr_context}\n"
+            "Extract any date from this text in YYYY:MM:DD format, or 'circa 1950s', etc. "
+            "If no date, return 'none'."
+        )
+        raw_date_str = ask_vlm(next_path, ocr_prompt).strip()
+
+    found_date, raw_date_text = parse_fuzzy_date(raw_date_str)
+    if found_date:
+        fuzzy_note = f" [dim](fuzzy: {raw_date_text})[/dim]" if raw_date_text else ""
+        console.print(f"      [dim]Date from back:[/dim] [bold]{found_date}[/bold]{fuzzy_note}")
+    else:
+        console.print(f"      [dim]No date on back — falling through to VLM guess.[/dim]")
+
+    comment_out = None
+    if raw_comment.lower() != "none" and raw_comment:
+        comment_out = raw_comment
+        console.print(f"      [dim]Comment:[/dim] {comment_out}")
+    else:
+        console.print(f"      [dim]No comment on back.[/dim]")
+
+    return found_date, raw_date_text, comment_out
+
+
+def _try_iptc_date(path):
+    """Phase 2: Scan existing IPTC keywords for a parseable date.
+
+    Returns (found_date, raw_date_text) or (None, None). Years outside the
+    plausible photo range (MIN_PHOTO_YEAR..MAX_YEAR) are rejected.
+    """
+    console.print(f"   [dim]2) IPTC keyword check…[/dim]")
+    iptc_keywords = get_iptc_metadata(path)
+    if not iptc_keywords:
+        console.print(f"      [dim]No IPTC keywords found.[/dim]")
+        return None, None
+
+    for keyword in iptc_keywords:
+        if not re.search(r'\d', keyword):
+            continue
+        found_date, raw_date_text = parse_fuzzy_date(keyword)
+        if not found_date:
+            continue
+        try:
+            yr = int(found_date.split(':')[0])
+        except (ValueError, IndexError):
+            continue
+        if not (MIN_PHOTO_YEAR <= yr <= MAX_YEAR):
+            continue
+        fuzzy_note = f" [dim](fuzzy: {raw_date_text})[/dim]" if raw_date_text else ""
+        console.print(f"      [dim]Date from IPTC '[/dim][bold]{keyword}[/bold][dim]':[/dim] [bold]{found_date}[/bold]{fuzzy_note}")
+        return found_date, raw_date_text
+
+    console.print(f"      [dim]No date found in IPTC keywords.[/dim]")
+    return None, None
+
+
+def _vlm_estimate_date(image_path, folder_hint, cutoff_year, confidence_threshold):
+    """Phase 3a: Ask the VLM for a date estimate via a focused single-task prompt.
+
+    Returns (found_date, raw_date_text, confidence). All three are None / 0
+    if the VLM didn't return a valid date.
+    """
+    date_prompt = (
+        "Analyze the fashion, hairstyles, technology, and setting in this photo to estimate when it was taken. "
+        f"{folder_hint}"
+        "Estimate the date as specifically as possible — could be YYYY:MM:DD, YYYY:MM, YYYY, "
+        "a decade like '1970s', or 'circa 1965'. "
+        f"The date must be before {cutoff_year}. "
+        "Also provide a confidence score from 1-10 for your date estimate.\n"
+        "Reply in EXACTLY this format with no other text:\n"
+        "DATE: <your estimate>\n"
+        "CONFIDENCE: <score 1-10>"
+    )
+    with console.status("[dim]Dating…[/dim]", spinner="dots"):
+        date_resp = ask_vlm(image_path, date_prompt, max_tokens=200) or ""
+    if not date_resp:
+        console.print(f"      [yellow]⚠ VLM returned no response for date estimate.[/yellow]")
+        return None, None, 0
+
+    date_match = re.search(r'DATE:\s*([^\n]+)',    date_resp)
+    conf_match = re.search(r'CONFIDENCE:\s*(\d+)', date_resp)
+    if not date_match:
+        return None, None, 0
+
+    raw_guess  = date_match.group(1).strip()
+    confidence = int(conf_match.group(1)) if conf_match else 5
+    found_date, raw_date_text = parse_fuzzy_date(raw_guess)
+
+    if not found_date:
+        console.print(f"      [dim]VLM could not determine a date. Raw: '[/dim]{raw_guess}[dim]' ({confidence}/10)[/dim]")
+        return None, None, confidence
+
+    # Validate that the parsed components are in plausible ranges
+    parts = found_date.split(':')
+    try:
+        year_val  = int(parts[0])
+        month_val = int(parts[1])
+        day_val   = int(parts[2].split()[0])
+        if not (MIN_PHOTO_YEAR <= year_val <= MAX_YEAR and 1 <= month_val <= 12 and 1 <= day_val <= 31):
+            console.print(f"      [yellow]⚠ Invalid date from VLM ('{raw_guess}') — discarding.[/yellow]")
+            return None, None, confidence
+    except (IndexError, ValueError):
+        console.print(f"      [yellow]⚠ Invalid date format ('{raw_guess}') — discarding.[/yellow]")
+        return None, None, confidence
+
+    fuzzy_note = f" [dim]— fuzzy: {raw_date_text}[/dim]" if raw_date_text else ""
+    conf_color = "green" if confidence >= confidence_threshold else "yellow" if confidence >= 5 else "red"
+    console.print(
+        f"      [dim]Date:[/dim]       [bold]{found_date}[/bold]  "
+        f"[[{conf_color}]{confidence}/10[/{conf_color}]]{fuzzy_note}"
+    )
+    return found_date, raw_date_text, confidence
+
+
+# Time-of-day words filtered out of keyword lists — they're already captured
+# in the dedicated TIME field, no need to duplicate them as tags.
+_TIME_WORDS = {"morning", "midday", "noon", "afternoon", "evening",
+               "night", "dawn", "dusk", "sunrise", "sunset", "golden hour"}
+
+
+def _vlm_describe_photo(image_path, folder_hint_loc, enable_geo):
+    """Phase 3b: Ask the VLM for time, scene, setting, flash, location, keywords.
+
+    Returns a dict with parsed fields. `geo_inline` and `geo_confidence` are
+    only populated when enable_geo is True.
+    """
+    geo_instruction = (
+        "LOCATION: <name a specific city, landmark, or building ONLY if you can identify it "
+        "from a visible sign, recognisable landmark, or distinctive architecture — "
+        "do NOT guess from general landscape appearance such as mountains or forest; "
+        "if uncertain write 'none'>\n"
+        "LOCATION_CONFIDENCE: <1-10 — how certain are you? "
+        "9-10: unmistakable landmark or sign visible; "
+        "6-8: strong architectural or environmental cues; "
+        "1-5: mostly guessing from general appearance>\n"
+    ) if enable_geo else ""
+    location_context = folder_hint_loc if enable_geo else ""
+
+    desc_prompt = (
+        f"{location_context}"
+        "Describe this photo. Reply in EXACTLY this format with no other text:\n"
+        "TIME: <time of day — e.g. 'morning', 'midday', 'afternoon', 'evening', or '3pm'>\n"
+        "SCENE: <one sentence describing the scene>\n"
+        "SETTING: <'indoor' or 'outdoor'>\n"
+        "FLASH: <'yes' or 'no' — whether flash appears to have fired>\n"
+        f"{geo_instruction}"
+        "KEYWORDS: <5 descriptive keywords, comma separated>"
+    )
+
+    with console.status("[dim]Describing…[/dim]", spinner="dots"):
+        resp = ask_vlm(image_path, desc_prompt) or ""
+    if not resp:
+        console.print(f"      [yellow]⚠ VLM returned no response — skipping description.[/yellow]")
+
+    # Field extraction
+    time_match     = re.search(r'TIME:\s*([^\n]+)',                resp)
+    scene_match    = re.search(r'SCENE:\s*([^\n]+)',               resp)
+    setting_match  = re.search(r'SETTING:\s*([^\n]+)',             resp)
+    flash_match    = re.search(r'FLASH:\s*([^\n]+)',               resp)
+    geo_match      = re.search(r'LOCATION:\s*([^\n]+)',            resp) if enable_geo else None
+    geo_conf_match = re.search(r'LOCATION_CONFIDENCE:\s*(\d+)',    resp) if enable_geo else None
+    keywords_match = re.search(r'KEYWORDS:\s*([^\n]+)',            resp)
+
+    # Time — parse first so we can use the parse outcome as the validity check.
+    raw_time_str = _clean_vlm_field(time_match.group(1)) if time_match else None
+    time_hour    = _parse_time_of_day(raw_time_str)
+    raw_time     = raw_time_str if time_hour is not None else None
+
+    # Scene — keep as-is
+    vlm_scene = _clean_vlm_field(scene_match.group(1)) if scene_match else None
+
+    # Setting — discard verbose multi-sentence responses
+    raw_setting = _clean_vlm_field(setting_match.group(1)) if setting_match else None
+    vlm_setting = raw_setting if raw_setting and len(raw_setting) < 30 else None
+
+    # Flash — strict yes/no
+    raw_flash = _clean_vlm_field(flash_match.group(1)).lower() if flash_match else None
+    vlm_flash = None
+    if raw_flash:
+        if   raw_flash.startswith('yes'): vlm_flash = 'yes'
+        elif raw_flash.startswith('no'):  vlm_flash = 'no'
+
+    # Keywords — strip time-of-day words; they're already in the TIME field
+    raw_keywords = _clean_vlm_field(keywords_match.group(1)) if keywords_match else None
+    tags_out = None
+    if raw_keywords:
+        filtered = [k.strip().lower() for k in raw_keywords.split(',')
+                    if k.strip().lower() not in _TIME_WORDS]
+        tags_out = ', '.join(filtered) if filtered else None
+
+    # Location — cleaned, paired with its confidence score
+    geo_inline = _clean_vlm_field(geo_match.group(1)) if geo_match else None
+    geo_confidence = int(geo_conf_match.group(1)) if geo_conf_match else 0
+
+    # Echo the parsed values to the console (caller doesn't need to do this)
+    if raw_time:    console.print(f"      [dim]Time:[/dim]       {raw_time}")
+    if vlm_scene:   console.print(f"      [dim]Scene:[/dim]      {vlm_scene}")
+    if vlm_setting: console.print(f"      [dim]Setting:[/dim]    {vlm_setting}")
+    if vlm_flash:   console.print(f"      [dim]Flash:[/dim]      {vlm_flash}")
+    if tags_out:    console.print(f"      [dim]Keywords:[/dim]   [dim]{tags_out}[/dim]")
+
+    return {
+        'time_hour':      time_hour,
+        'raw_time':       raw_time,
+        'scene':          vlm_scene,
+        'setting':        vlm_setting,
+        'flash':          vlm_flash,
+        'tags':           tags_out,
+        'geo_inline':     geo_inline,
+        'geo_confidence': geo_confidence,
+    }
+
+
+# Phrases that mean "I couldn't identify a location" — used to reject hedged
+# VLM responses that would otherwise pass the basic-validity check.
+_LOCATION_HEDGE_PHRASES = (
+    "no identifiable", "no clear", "cannot identify", "unable to",
+    "no location", "no specific", "there are no", "i cannot", "i can't",
+    "unsorted", "folder", "unknown", "region", "likely",
+)
+
+
+def _resolve_location(geo_resp_inline, geo_confidence, folder_name, threshold):
+    """Phase 4: Validate the VLM's location guess and geocode it via Nominatim.
+
+    Two gates:
+      1. The response must not be empty, hedged, or just echo the folder name.
+      2. The location confidence must meet the threshold (default 7).
+
+    Returns GPS coords (lat, lon) tuple, or None if either gate fails or
+    Nominatim doesn't recognise the place.
+    """
+    console.print(f"   [dim]4) Location check…[/dim]")
+    geo_resp = geo_resp_inline or ""
+    geo_resp = re.sub(r'\s*\(.*?\)', '', geo_resp).strip()
+    loc_conf = geo_confidence
+
+    # Gate 1: basic validity — non-empty, not hedged, not echoing the folder
+    is_valid = (
+        geo_resp.lower() not in ("", "none")
+        and len(geo_resp) < 80
+        and geo_resp.lower() != folder_name.lower()
+        and not any(phrase in geo_resp.lower() for phrase in _LOCATION_HEDGE_PHRASES)
+    )
+
+    # Gate 2: confidence — gate out low-confidence guesses that pass gate 1
+    # (e.g. "Calgary, Alberta" with a 4/10 — clearly inferring from landscape)
+    if is_valid and loc_conf < threshold:
+        console.print(
+            f"      [dim]Location skipped:[/dim] [yellow]{geo_resp}[/yellow] "
+            f"[dim](confidence {loc_conf}/10 < {threshold} — landscape guess)[/dim]"
+        )
+        return None
+
+    if not is_valid:
+        if not geo_resp or geo_resp.lower() == "none":
+            console.print(f"      [dim]No location identified.[/dim]")
+        return None
+
+    console.print(f"      [dim]Location:[/dim]   {geo_resp} [dim]({loc_conf}/10)[/dim]")
+    coords = geolocate(geo_resp)
+    if coords:
+        console.print(f"      [dim]GPS:[/dim]        {coords[0]:.4f}, {coords[1]:.4f}")
+        return coords
+
+    # Nominatim didn't recognise it — try simplifying (drop everything after a comma)
+    simplified = geo_resp.split(',')[0].strip()
+    if simplified and simplified.lower() != geo_resp.lower():
+        console.print(f"      [dim]Retrying with:[/dim] '{simplified}'")
+        coords = geolocate(simplified)
+        if coords:
+            console.print(f"      [dim]GPS:[/dim]        {coords[0]:.4f}, {coords[1]:.4f}")
+            return coords
+
+    console.print(f"      [dim]Could not resolve GPS — skipping.[/dim]")
+    return None
+
+
+def _apply_consensus_year(results, confidence_threshold):
+    """Phase 6 (when folder_consensus): rewrite low-confidence dates to the
+    folder's modal year, preserving each photo's individual month/day/time.
+
+    A consensus is only declared when the modal year holds a strict majority
+    (> 50%) of the high-confidence votes. A weak plurality (e.g. 2/8 distinct
+    years) is treated as no consensus — the low-confidence photos go to the
+    review queue rather than being force-aligned to a noisy mode. This matters
+    on rolls where the VLM is inconsistent across visually similar scenes.
+
+    Returns the consensus year, or None if there's no majority. The results
+    list is mutated in place only when a real consensus is applied.
+    """
+    high_conf_years = [
+        int(r['found_date'][:4])
+        for r in results
+        if r['confidence'] >= confidence_threshold
+    ]
+    if not high_conf_years:
+        console.print(f"\n   [yellow]⚠ No high-confidence results to derive consensus year.[/yellow]")
+        return None
+
+    modal_year, votes = Counter(high_conf_years).most_common(1)[0]
+    total = len(high_conf_years)
+
+    # Require a strict majority. With 8 photos in 8 different years where one
+    # year happens to appear twice, this is noise, not consensus — refuse to
+    # apply it.
+    if votes * 2 <= total:
+        console.print(
+            f"\n   [yellow]⚠ No clear consensus year[/yellow] "
+            f"[dim](top year {modal_year} has only {votes}/{total} votes — needs a majority). "
+            f"Low-confidence photos will go to the review queue.[/dim]"
+        )
+        return None
+
+    console.print(
+        f"\n   [cyan]🗳 Consensus year: {modal_year}[/cyan] "
+        f"[dim]({votes}/{total} high-confidence result(s))[/dim]"
+    )
+
+    for r in results:
+        if r['confidence'] < confidence_threshold:
+            r['found_date'] = f"{modal_year}:{r['found_date'][5:]}"
+            console.print(f"      [dim]📅 {r['file']}: overridden to {r['found_date']} via consensus[/dim]")
+
+    return modal_year
+
+
+def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, global_offset=0, global_total=None, folder_consensus=False, root_folder=None, dry_run=False, skip_dated=False, review_queue_accumulator=None, shared_durations=None, batch_totals=None, geo_confidence_threshold=7):
     """Process one folder of photos.
 
     review_queue_accumulator: optional shared list. If provided, low-confidence
@@ -1040,9 +1469,9 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
     shared_durations: optional deque passed from process_archive in recursive
     mode so the rolling ETA is computed across all folders, not reset per folder.
 
-    batch_totals: optional dict with keys 'written', 'reviewed', 'no_date',
-    'cutoff_skip', 'backs' for accumulating run-wide counts shown in the final
-    summary panel.
+    batch_totals: optional dict with keys 'scanned', 'date_written', 'tagged_no_date',
+    'nothing_written', 'reviewed', 'cutoff_skip', 'backs' for accumulating run-wide
+    counts shown in the final summary panel.
     """
     processed_files = set()
     review_queue = []
@@ -1050,7 +1479,12 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
     completed_paths = _load_checkpoint(root_folder or folder) if not dry_run else set()
     if dry_run and os.path.exists(_checkpoint_path(root_folder or folder)):
         console.print("   [dim]ℹ Dry-run: ignoring existing checkpoint, re-analyzing all files.[/dim]")
-    no_date_count = 0
+    # Counter buckets. Kept separate so the summary can distinguish three real cases:
+    #   - tagged_no_date: VLM gave us description/keywords but no usable date — we wrote those.
+    #   - nothing_written: VLM returned nothing useful at all (no date, no scene, no tags).
+    #   - cutoff_skip: date was found but it's at/after the user's cutoff year.
+    tagged_no_date_count = 0
+    nothing_written_count = 0
     cutoff_skip_count = 0
 
     folder_name = os.path.basename(folder)
@@ -1058,6 +1492,17 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
     hint = "" if folder_name_useful else "  [dim](low-signal name — not passed to VLM)[/dim]"
     console.print(f"   [bold]📁 {folder_name}[/bold]{hint}")
     console.print(f"   [dim]Archiving {len(files)} photo(s)…[/dim]\n")
+
+    # Folder hints — only injected as VLM context when the folder name looks
+    # meaningful (carries a year or has real words), otherwise empty.
+    folder_hint_date = (
+        f"The folder containing this photo is named '{folder_name}' — treat this as high-confidence information for the date. "
+        if folder_name_useful else ""
+    )
+    folder_hint_loc = (
+        f"The folder containing this photo is named '{folder_name}' — treat this as high-confidence information for the location. "
+        if folder_name_useful else ""
+    )
 
     # Rolling-window ETA. In recursive mode, shared_durations is passed in from
     # process_archive so timings accumulate across all folders — giving a
@@ -1086,17 +1531,9 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
                 continue
 
             current_path = os.path.join(folder, current_file)
-            found_date = None
-            found_comment = None
-            raw_date_text = None
-            confidence = 10
-            gps_coords = None
-
             pos = global_offset + i + 1
             total_str = str(global_total) if global_total else str(len(files))
-
             _photo_start = time.monotonic()
-
             progress.update(task, description=f"[bold cyan]{current_file}[/bold cyan]")
 
             if current_path in completed_paths:
@@ -1111,442 +1548,191 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
 
             console.print(f"\n  [bold][{pos}/{total_str}][/bold] [cyan]{current_file}[/cyan]")
 
-            # Step 1: Check if the NEXT photo is the back
-            console.print(f"   [dim]1) Back-of-photo check…[/dim]")
-            next_readable = False
-            next_path = None
-            if i + 1 < len(files):
-                next_file = files[i+1]
-                next_path = os.path.join(folder, next_file)
+            # Accumulate everything we learn about this photo into a single struct.
+            # This keeps the dispatch at the end (step 5) clean — we just read from
+            # `analysis` instead of juggling 10 separate locals.
+            analysis = PhotoAnalysis()
 
-                try:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        _test = Image.open(next_path)
-                        _test.load()
-                        _test.close()
-                    next_readable = True
-                except Exception:
-                    console.print(f"      [yellow]⚠ Could not open {next_file} — skipping back check.[/yellow]")
+            # Step 1: Back-of-photo check
+            found_date, raw_date_text, comment = _try_back_of_photo(folder, files, i, processed_files)
+            if found_date:
+                analysis.found_date    = found_date
+                analysis.raw_date_text = raw_date_text
+            if comment:
+                analysis.comment = comment
 
-            if next_readable:
-                # Single VLM call: detect back AND extract date + comment simultaneously
-                back_prompt = (
-                    "Look very carefully at this image. "
-                    "First determine: is this the BACK (reverse side) of a physical printed photograph? "
-                    "The back shows blank paper, handwriting, stamps, photo lab printing, or a plain surface — no photographic scene. "
-                    "Reply in this exact format:\n"
-                    "IS_BACK: <yes or no>\n"
-                    "DATE: <any date written on it in YYYY:MM:DD format, or 'circa 1950s', or 'none'>\n"
-                    "COMMENT: <any other handwritten or printed text excluding dates, translated to English, or 'none'>"
-                )
-                back_resp = ask_vlm(next_path, back_prompt)
-                is_back = False
-                if back_resp:
-                    is_back_line = re.search(r'IS_BACK:\s*([^\n]+)', back_resp)
-                    if is_back_line and is_back_line.group(1).strip().lower().startswith("yes"):
-                        is_back = True
+            # Step 2: IPTC keyword check (only if step 1 didn't yield a date)
+            if not analysis.found_date:
+                found_date, raw_date_text = _try_iptc_date(current_path)
+                if found_date:
+                    analysis.found_date    = found_date
+                    analysis.raw_date_text = raw_date_text
 
-                if is_back:
-                    console.print(f"      [green]Back confirmed:[/green] {next_file}")
-                    processed_files.add(next_file)
-
-                    date_line = re.search(r'DATE:\s*([^\n]+)', back_resp)
-                    comment_line = re.search(r'COMMENT:\s*([^\n]+)', back_resp)
-                    raw_date_str = date_line.group(1).strip() if date_line else "none"
-                    raw_comment = comment_line.group(1).strip() if comment_line else "none"
-
-                    ocr_context = run_tesseract(next_path)
-                    if ocr_context and raw_date_str.lower() == "none":
-                        console.print(f"      [dim]Tesseract OCR found text — re-checking for date…[/dim]")
-                        ocr_prompt = (
-                            f"This is the back of a photo. OCR extracted: {ocr_context}\n"
-                            "Extract any date from this text in YYYY:MM:DD format, or 'circa 1950s', etc. "
-                            "If no date, return 'none'."
-                        )
-                        raw_date_str = ask_vlm(next_path, ocr_prompt).strip()
-
-                    found_date, raw_date_text = parse_fuzzy_date(raw_date_str)
-                    if found_date:
-                        fuzzy_note = f" [dim](fuzzy: {raw_date_text})[/dim]" if raw_date_text else ""
-                        console.print(f"      [dim]Date from back:[/dim] [bold]{found_date}[/bold]{fuzzy_note}")
-                    else:
-                        console.print(f"      [dim]No date on back — falling through to VLM guess.[/dim]")
-
-                    if raw_comment.lower() != "none" and raw_comment:
-                        found_comment = raw_comment
-                        console.print(f"      [dim]Comment:[/dim] {found_comment}")
-                    else:
-                        console.print(f"      [dim]No comment on back.[/dim]")
-                else:
-                    console.print(f"      [dim]No back detected.[/dim]")
-            else:
-                console.print(f"      [dim]No next image to check.[/dim]")
-
-            # Step 2: Check IPTC keywords for a date
-            if not found_date:
-                console.print(f"   [dim]2) IPTC keyword check…[/dim]")
-                iptc_keywords = get_iptc_metadata(current_path)
-                if iptc_keywords:
-                    for keyword in iptc_keywords:
-                        if not re.search(r'\d', keyword):
-                            continue
-                        found_date, raw_date_text = parse_fuzzy_date(keyword)
-                        if found_date:
-                            try:
-                                yr = int(found_date.split(':')[0])
-                                if not (MIN_PHOTO_YEAR <= yr <= MAX_YEAR):
-                                    found_date = None
-                                    continue
-                            except (ValueError, IndexError):
-                                found_date = None
-                                continue
-                            fuzzy_note = f" [dim](fuzzy: {raw_date_text})[/dim]" if raw_date_text else ""
-                            console.print(f"      [dim]Date from IPTC '[/dim][bold]{keyword}[/bold][dim]':[/dim] [bold]{found_date}[/bold]{fuzzy_note}")
-                            break
-                    if not found_date:
-                        console.print(f"      [dim]No date found in IPTC keywords.[/dim]")
-                else:
-                    console.print(f"      [dim]No IPTC keywords found.[/dim]")
-
-            # Step 3: VLM analysis. Internally this is two focused calls when needed:
-            # a date-only call (only when no date was found from back-of-photo or IPTC)
-            # followed by a description call. Combining the two tasks measurably hurt
-            # confidence calibration, so they're separated. From the user's point of
-            # view this is one "analyze the image" step — the calls aren't surfaced.
-            raw_time = None
-            vlm_scene = None
-            vlm_setting = None
-            vlm_flash = None
-            tags_resp = None
-            geo_resp_inline = None
-
-            # Only inject the folder name as VLM context when it looks meaningful —
-            # noise like "New Folder (2)" or "Scans_Batch_3" otherwise primes the
-            # model with garbage.
-            folder_hint_date = (
-                f"The folder containing this photo is named '{folder_name}' — treat this as high-confidence information for the date. "
-                if folder_name_useful else ""
-            )
-            folder_hint_loc = (
-                f"The folder containing this photo is named '{folder_name}' — treat this as high-confidence information for the location. "
-                if folder_name_useful else ""
-            )
-
+            # Step 3: VLM analysis — two focused calls. Date estimation is skipped
+            # when we already have a date from steps 1 or 2.
             console.print(f"   [dim]3) Analyzing image…[/dim]")
-
-            # Internal date call — focused single-task prompt for date estimation.
-            # Skipped when a date was already extracted from back-of-photo or IPTC.
-            if not found_date:
-                date_prompt = (
-                    "Analyze the fashion, hairstyles, technology, and setting in this photo to estimate when it was taken. "
-                    f"{folder_hint_date}"
-                    "Estimate the date as specifically as possible — could be YYYY:MM:DD, YYYY:MM, YYYY, "
-                    "a decade like '1970s', or 'circa 1965'. "
-                    f"The date must be before {cutoff_year}. "
-                    "Also provide a confidence score from 1-10 for your date estimate.\n"
-                    "Reply in EXACTLY this format with no other text:\n"
-                    "DATE: <your estimate>\n"
-                    "CONFIDENCE: <score 1-10>"
+            if not analysis.found_date:
+                found_date, raw_date_text, confidence = _vlm_estimate_date(
+                    current_path, folder_hint_date, cutoff_year, confidence_threshold,
                 )
-                with console.status("[dim]Dating…[/dim]", spinner="dots"):
-                    date_resp = ask_vlm(current_path, date_prompt, max_tokens=200)
-                if not date_resp:
-                    console.print(f"      [yellow]⚠ VLM returned no response for date estimate.[/yellow]")
-                    date_resp = ""
+                if found_date:
+                    analysis.found_date    = found_date
+                    analysis.raw_date_text = raw_date_text
+                    analysis.confidence    = confidence
+                # If found_date is None, analysis.confidence stays at its default (10)
+                # but won't be checked — the no-date branch in step 5 ignores it.
 
-                date_line = re.search(r'DATE:\s*([^\n]+)',    date_resp)
-                conf_line = re.search(r'CONFIDENCE:\s*(\d+)', date_resp)
+            desc = _vlm_describe_photo(current_path, folder_hint_loc, enable_geo)
+            analysis.time_hour = desc['time_hour']
+            analysis.scene     = desc['scene']
+            analysis.setting   = desc['setting']
+            analysis.flash     = desc['flash']
+            analysis.tags      = desc['tags']
 
-                if date_line:
-                    raw_guess = date_line.group(1).strip()
-                    confidence = int(conf_line.group(1)) if conf_line else 5
-                    found_date, raw_date_text = parse_fuzzy_date(raw_guess)
-                    if found_date:
-                        parts = found_date.split(':')
-                        try:
-                            year_val = int(parts[0])
-                            month_val = int(parts[1])
-                            day_val = int(parts[2].split()[0])
-                            if not (MIN_PHOTO_YEAR <= year_val <= MAX_YEAR and 1 <= month_val <= 12 and 1 <= day_val <= 31):
-                                console.print(f"      [yellow]⚠ Invalid date from VLM ('{raw_guess}') — discarding.[/yellow]")
-                                found_date = None
-                            else:
-                                fuzzy_note = f" [dim]— fuzzy: {raw_date_text}[/dim]" if raw_date_text else ""
-                                conf_color = "green" if confidence >= 7 else "yellow" if confidence >= 5 else "red"
-                                console.print(
-                                    f"      [dim]Date:[/dim]       [bold]{found_date}[/bold]  "
-                                    f"[[{conf_color}]{confidence}/10[/{conf_color}]]{fuzzy_note}"
-                                )
-                        except (IndexError, ValueError):
-                            console.print(f"      [yellow]⚠ Invalid date format ('{raw_guess}') — discarding.[/yellow]")
-                            found_date = None
-                    else:
-                        console.print(f"      [dim]VLM could not determine a date. Raw: '[/dim]{raw_guess}[dim]' ({confidence}/10)[/dim]")
+            # If we have a date, apply the VLM's time-of-day estimate (or noon as fallback)
+            if analysis.found_date:
+                applied_hour = analysis.time_hour if analysis.time_hour is not None else 12
+                analysis.found_date = analysis.found_date[:11] + f"{applied_hour:02d}:00:00"
+                time_note = f" [dim](~{desc['raw_time']})[/dim]" if desc['raw_time'] else ""
+                console.print(f"      [dim]Timestamp:[/dim]  [bold]{analysis.found_date}[/bold]{time_note}")
 
-            # Internal description call — time, scene, setting, flash, location, keywords.
-            # The location prompt explicitly requires a specific identifiable feature
-            # (landmark, sign, distinctive building) — not just general landscape appearance.
-            # We also ask for a location confidence score and only geocode high-confidence hits.
-            geo_instruction = (
-                "LOCATION: <name a specific city, landmark, or building ONLY if you can identify it "
-                "from a visible sign, recognisable landmark, or distinctive architecture — "
-                "do NOT guess from general landscape appearance such as mountains or forest; "
-                "if uncertain write 'none'>\n"
-                "LOCATION_CONFIDENCE: <1-10 — how certain are you? "
-                "9-10: unmistakable landmark or sign visible; "
-                "6-8: strong architectural or environmental cues; "
-                "1-5: mostly guessing from general appearance>\n"
-            ) if enable_geo else ""
-
-            location_context = folder_hint_loc if enable_geo else ""
-
-            desc_prompt = (
-                f"{location_context}"
-                "Describe this photo. Reply in EXACTLY this format with no other text:\n"
-                "TIME: <time of day — e.g. 'morning', 'midday', 'afternoon', 'evening', or '3pm'>\n"
-                "SCENE: <one sentence describing the scene>\n"
-                "SETTING: <'indoor' or 'outdoor'>\n"
-                "FLASH: <'yes' or 'no' — whether flash appears to have fired>\n"
-                f"{geo_instruction}"
-                "KEYWORDS: <5 descriptive keywords, comma separated>"
-            )
-
-            with console.status("[dim]Describing…[/dim]", spinner="dots"):
-                resp = ask_vlm(current_path, desc_prompt)
-            if not resp:
-                console.print(f"      [yellow]⚠ VLM returned no response — skipping description.[/yellow]")
-                resp = ""
-
-            # Parse description fields from the response
-            time_line      = re.search(r'TIME:\s*([^\n]+)',                resp)
-            scene_line     = re.search(r'SCENE:\s*([^\n]+)',               resp)
-            setting_line   = re.search(r'SETTING:\s*([^\n]+)',             resp)
-            flash_line     = re.search(r'FLASH:\s*([^\n]+)',               resp)
-            geo_line       = re.search(r'LOCATION:\s*([^\n]+)',            resp) if enable_geo else None
-            geo_conf_line  = re.search(r'LOCATION_CONFIDENCE:\s*(\d+)',   resp) if enable_geo else None
-            keywords_line  = re.search(r'KEYWORDS:\s*([^\n]+)',            resp)
-
-            geo_confidence = int(geo_conf_line.group(1)) if geo_conf_line else 0
-
-            # Parse the time field first, then use the parse result as the validity signal.
-            # This is more robust than denylisting phrases like "studio lighting" — if the
-            # VLM returned "early morning, around 7am" (>40 chars, used to be discarded),
-            # the parser still finds 7am. If it returned a hedge like "cannot determine
-            # from indoor lighting", the parser finds nothing and the caller falls back.
-            _raw_time_str = _clean_vlm_field(time_line.group(1)) if time_line else None
-            time_hour = _parse_time_of_day(_raw_time_str)
-            raw_time = _raw_time_str if time_hour is not None else None
-
-            vlm_scene   = _clean_vlm_field(scene_line.group(1))        if scene_line   else None
-            _raw_setting = _clean_vlm_field(setting_line.group(1)) if setting_line else None
-            _raw_flash   = _clean_vlm_field(flash_line.group(1)).lower() if flash_line else None
-            # Discard verbose multi-sentence responses — keep only short single-word/phrase answers
-            vlm_setting = _raw_setting if _raw_setting and len(_raw_setting) < 30 else None
-            vlm_flash   = None
-            if _raw_flash:
-                if _raw_flash.startswith('yes'):
-                    vlm_flash = 'yes'
-                elif _raw_flash.startswith('no'):
-                    vlm_flash = 'no'
-
-            # Filter time-of-day words from keywords
-            _raw_keywords = _clean_vlm_field(keywords_line.group(1)) if keywords_line else None
-            if _raw_keywords:
-                _time_words = {"morning", "midday", "noon", "afternoon", "evening",
-                               "night", "dawn", "dusk", "sunrise", "sunset", "golden hour"}
-                filtered = [k.strip().lower() for k in _raw_keywords.split(',')
-                            if k.strip().lower() not in _time_words]
-                tags_resp = ', '.join(filtered) if filtered else None
-            else:
-                tags_resp = None
-            geo_resp_inline     = _clean_vlm_field(geo_line.group(1))  if geo_line  else None
-            geo_resp_confidence = geo_confidence
-
-            if raw_time:    console.print(f"      [dim]Time:[/dim]       {raw_time}")
-            if vlm_scene:   console.print(f"      [dim]Scene:[/dim]      {vlm_scene}")
-            if vlm_setting: console.print(f"      [dim]Setting:[/dim]    {vlm_setting}")
-            if vlm_flash:   console.print(f"      [dim]Flash:[/dim]      {vlm_flash}")
-            if tags_resp:   console.print(f"      [dim]Keywords:[/dim]   [dim]{tags_resp}[/dim]")
-
-            if found_date:
-                applied_hour = time_hour if time_hour is not None else 12
-                found_date = found_date[:11] + f"{applied_hour:02d}:00:00"
-                time_note = f" [dim](~{raw_time})[/dim]" if raw_time else ""
-                console.print(f"      [dim]Timestamp:[/dim]  [bold]{found_date}[/bold]{time_note}")
-
+            # Step 4: Location resolution (only when --geotag is on)
             if enable_geo:
-                console.print(f"   [dim]4) Location check…[/dim]")
-                geo_resp = geo_resp_inline or ""
-                geo_resp = re.sub(r'\s*\(.*?\)', '', geo_resp).strip()
-                loc_conf = geo_resp_confidence
-
-                # Gate 1: basic validity — not empty, not a hedge phrase
-                is_valid_location = (
-                    geo_resp.lower() not in ("", "none")
-                    and len(geo_resp) < 80
-                    and geo_resp.lower() != folder_name.lower()
-                    and not any(phrase in geo_resp.lower() for phrase in [
-                        "no identifiable", "no clear", "cannot identify", "unable to",
-                        "no location", "no specific", "there are no", "i cannot", "i can't",
-                        "unsorted", "folder", "unknown", "region", "likely"
-                    ])
+                analysis.gps = _resolve_location(
+                    desc['geo_inline'], desc['geo_confidence'],
+                    folder_name, geo_confidence_threshold,
                 )
-                # Gate 2: confidence threshold — only geocode when the VLM is sure
-                # it saw a specific identifiable feature, not just guessed from landscape.
-                GEO_CONFIDENCE_THRESHOLD = 7
-                if is_valid_location and loc_conf < GEO_CONFIDENCE_THRESHOLD:
-                    console.print(
-                        f"      [dim]Location skipped:[/dim] [yellow]{geo_resp}[/yellow] "
-                        f"[dim](confidence {loc_conf}/10 < {GEO_CONFIDENCE_THRESHOLD} — landscape guess)[/dim]"
-                    )
-                    is_valid_location = False
 
-                if is_valid_location:
-                    console.print(f"      [dim]Location:[/dim]   {geo_resp} [dim]({loc_conf}/10)[/dim]")
-                    gps_coords = geolocate(geo_resp)
-                    if gps_coords:
-                        console.print(f"      [dim]GPS:[/dim]        {gps_coords[0]:.4f}, {gps_coords[1]:.4f}")
-                    else:
-                        simplified = geo_resp.split(',')[0].strip()
-                        if simplified and simplified.lower() != geo_resp.lower():
-                            console.print(f"      [dim]Retrying with:[/dim] '{simplified}'")
-                            gps_coords = geolocate(simplified)
-                            if gps_coords:
-                                console.print(f"      [dim]GPS:[/dim]        {gps_coords[0]:.4f}, {gps_coords[1]:.4f}")
-                            else:
-                                console.print(f"      [dim]Could not resolve GPS — skipping.[/dim]")
-                        else:
-                            console.print(f"      [dim]Could not resolve GPS — skipping.[/dim]")
-                else:
-                    if not geo_resp or geo_resp.lower() == "none":
-                        console.print(f"      [dim]No location identified.[/dim]")
-
+            # Step 5: Decide what to write
             console.print(f"   [dim]5) Writing metadata…[/dim]")
-            if found_date:
+            if analysis.found_date:
                 try:
-                    year = int(found_date[:4])
-                    if year < cutoff_year:
-                        if folder_consensus:
-                            results.append({
-                                "file": current_file,
-                                "path": current_path,
-                                "found_date": found_date,
-                                "confidence": confidence,
-                                "tags": tags_resp,
-                                "comment": found_comment,
-                                "raw_date": raw_date_text,
-                                "gps": gps_coords,
-                                "scene": vlm_scene,
-                                "setting": vlm_setting,
-                                "flash": vlm_flash,
-                            })
-                            console.print(f"      [dim]Queued for consensus write.[/dim]")
-                        else:
-                            if confidence >= confidence_threshold:
-                                if dry_run:
-                                    console.print(f"      [dim][DRY RUN] Would write: {found_date} | tags: {tags_resp}[/dim]")
-                                else:
-                                    apply_metadata(current_path, found_date, tags=tags_resp, comment=found_comment,
-                                                   raw_date=raw_date_text, gps=gps_coords, xmp_only=xmp_only,
-                                                   scene=vlm_scene, setting=vlm_setting, flash=vlm_flash)
-                                    _save_checkpoint(root_folder or folder, current_path)
-                            else:
-                                console.print(f"      [yellow]⚠ Low confidence ({confidence}/10) — added to review queue.[/yellow]")
-                                review_queue.append({
-                                    "folder": folder_name,
-                                    "file": current_file,
-                                    "path": current_path,
-                                    "raw_guess": raw_date_text or found_date,
-                                    "found_date": found_date,
-                                    "confidence": confidence,
-                                    "comment": found_comment or "—",
-                                    "tags": tags_resp,
-                                    "raw_date": raw_date_text,
-                                    "gps": list(gps_coords) if gps_coords else None,
-                                    "scene": vlm_scene,
-                                    "setting": vlm_setting,
-                                    "flash": vlm_flash,
-                                })
+                    year = int(analysis.found_date[:4])
+                except (ValueError, IndexError):
+                    console.print(f"      [red]✗ Malformed date: {analysis.found_date}[/red]")
+                    year = None
+
+                if year is None:
+                    pass  # error already printed
+                elif year >= cutoff_year:
+                    console.print(f"      [dim]⏭ Skipping: date {year} is {cutoff_year} or later.[/dim]")
+                    cutoff_skip_count += 1
+                elif folder_consensus:
+                    # Defer the write until we've seen all photos in the folder
+                    results.append({
+                        "file":       current_file,
+                        "path":       current_path,
+                        "found_date": analysis.found_date,
+                        "confidence": analysis.confidence,
+                        "tags":       analysis.tags,
+                        "comment":    analysis.comment,
+                        "raw_date":   analysis.raw_date_text,
+                        "gps":        analysis.gps,
+                        "scene":      analysis.scene,
+                        "setting":    analysis.setting,
+                        "flash":      analysis.flash,
+                    })
+                    console.print(f"      [dim]Queued for consensus write.[/dim]")
+                elif analysis.confidence >= confidence_threshold:
+                    # High-confidence dated photo — write immediately
+                    if dry_run:
+                        console.print(f"      [dim][DRY RUN] Would write: {analysis.found_date} | tags: {analysis.tags}[/dim]")
                     else:
-                        console.print(f"      [dim]⏭ Skipping: date {year} is {cutoff_year} or later.[/dim]")
-                        cutoff_skip_count += 1
-                except Exception as e:
-                    console.print(f"      [red]✗ Write error: {e}[/red]")
+                        apply_metadata(
+                            current_path, analysis.found_date,
+                            tags=analysis.tags, comment=analysis.comment,
+                            raw_date=analysis.raw_date_text, gps=analysis.gps,
+                            xmp_only=xmp_only,
+                            scene=analysis.scene, setting=analysis.setting, flash=analysis.flash,
+                        )
+                        _save_checkpoint(root_folder or folder, current_path)
+                else:
+                    # Low-confidence dated photo — queue for interactive review
+                    console.print(f"      [yellow]⚠ Low confidence ({analysis.confidence}/10) — added to review queue.[/yellow]")
+                    review_queue.append({
+                        "folder":     folder_name,
+                        "file":       current_file,
+                        "path":       current_path,
+                        "raw_guess":  analysis.raw_date_text or analysis.found_date,
+                        "found_date": analysis.found_date,
+                        "confidence": analysis.confidence,
+                        "comment":    analysis.comment or "—",
+                        "tags":       analysis.tags,
+                        "raw_date":   analysis.raw_date_text,
+                        "gps":        list(analysis.gps) if analysis.gps else None,
+                        "scene":      analysis.scene,
+                        "setting":    analysis.setting,
+                        "flash":      analysis.flash,
+                    })
             else:
-                has_something = any([tags_resp, vlm_scene, vlm_setting, vlm_flash, found_comment, gps_coords])
+                # No date at all — but we may still have description/keywords/etc. to write
+                has_something = any([analysis.tags, analysis.scene, analysis.setting,
+                                     analysis.flash, analysis.comment, analysis.gps])
                 if has_something:
                     console.print(f"      [yellow]⚠ No date found — writing description/keywords only.[/yellow]")
                     if dry_run:
-                        console.print(f"      [dim][DRY RUN] Would write: tags: {tags_resp} | scene: {vlm_scene}[/dim]")
+                        console.print(f"      [dim][DRY RUN] Would write: tags: {analysis.tags} | scene: {analysis.scene}[/dim]")
                     else:
-                        apply_metadata(current_path, None, tags=tags_resp, comment=found_comment,
-                                       raw_date=raw_date_text, gps=gps_coords, xmp_only=xmp_only,
-                                       scene=vlm_scene, setting=vlm_setting, flash=vlm_flash)
+                        apply_metadata(
+                            current_path, None,
+                            tags=analysis.tags, comment=analysis.comment,
+                            raw_date=analysis.raw_date_text, gps=analysis.gps,
+                            xmp_only=xmp_only,
+                            scene=analysis.scene, setting=analysis.setting, flash=analysis.flash,
+                        )
                         _save_checkpoint(root_folder or folder, current_path)
+                    tagged_no_date_count += 1
                 else:
                     console.print(f"      [red]✗ No date or description found — skipping.[/red]")
-                no_date_count += 1
+                    nothing_written_count += 1
 
-            # Record this photo's wall-clock duration and recompute ETA.
-            # In recursive mode global_total is set, so remaining spans the
-            # whole batch — not just the current folder.
+            # Rolling ETA update
             _durations.append(time.monotonic() - _photo_start)
             photos_done  = global_offset + i + 1
             photos_total = global_total if global_total is not None else len(files)
             remaining    = max(0, photos_total - photos_done)
             if len(_durations) >= MIN_SAMPLES and remaining > 0:
                 avg_sec  = sum(_durations) / len(_durations)
-                eta_sec  = avg_sec * remaining
-                _eta_str = f"[dim]{_format_eta(eta_sec)} remaining[/dim]"
+                _eta_str = f"[dim]{_format_eta(avg_sec * remaining)} remaining[/dim]"
             elif remaining == 0:
                 _eta_str = ""
             progress.update(task, eta=_eta_str)
             progress.advance(task)
 
-    # Apply folder consensus year if enabled
+    # Folder consensus pass — rewrite low-confidence dates to the modal year
     if folder_consensus and results:
-        # Collect years from high-confidence results only
-        high_conf_years = [
-            int(r['found_date'][:4])
-            for r in results
-            if r['confidence'] >= confidence_threshold
-        ]
-        if high_conf_years:
-            consensus_year = Counter(high_conf_years).most_common(1)[0][0]
-            console.print(f"\n   [cyan]🗳 Consensus year: {consensus_year}[/cyan] [dim]({len(high_conf_years)} high-confidence result(s))[/dim]")
-        else:
-            consensus_year = None
-            console.print(f"\n   [yellow]⚠ No high-confidence results to derive consensus year.[/yellow]")
-
+        consensus_year = _apply_consensus_year(results, confidence_threshold)
         for r in results:
-            date = r['found_date']
-            if consensus_year and r['confidence'] < confidence_threshold:
-                date = f"{consensus_year}:{date[5:]}"
-                console.print(f"      [dim]📅 {r['file']}: overridden to {date} via consensus[/dim]")
             if r['confidence'] >= confidence_threshold or consensus_year:
                 if dry_run:
-                    console.print(f"      [dim][DRY RUN] Would write: {date} | tags: {r['tags']}[/dim]")
+                    console.print(f"      [dim][DRY RUN] Would write: {r['found_date']} | tags: {r['tags']}[/dim]")
                 else:
-                    apply_metadata(r['path'], date, tags=r['tags'], comment=r['comment'],
-                                   raw_date=r['raw_date'], gps=r['gps'], xmp_only=xmp_only,
-                                   scene=r['scene'], setting=r['setting'], flash=r['flash'])
+                    apply_metadata(
+                        r['path'], r['found_date'],
+                        tags=r['tags'], comment=r['comment'],
+                        raw_date=r['raw_date'], gps=r['gps'],
+                        xmp_only=xmp_only,
+                        scene=r['scene'], setting=r['setting'], flash=r['flash'],
+                    )
                     _save_checkpoint(root_folder or folder, r['path'])
             else:
+                # No high-confidence results in the folder — fall back to review queue.
+                # We have a results dict in hand, so build the review entry directly
+                # rather than round-tripping through PhotoAnalysis just to flatten back out.
                 review_queue.append({
-                    "folder": folder_name,
-                    "file": r['file'],
-                    "path": r['path'],
-                    "raw_guess": r['raw_date'] or date,
-                    "found_date": date,
+                    "folder":     folder_name,
+                    "file":       r['file'],
+                    "path":       r['path'],
+                    "raw_guess":  r.get('raw_date') or r['found_date'],
+                    "found_date": r['found_date'],
                     "confidence": r['confidence'],
-                    "comment": r['comment'] or "—",
-                    "tags": r.get('tags'),
-                    "raw_date": r.get('raw_date'),
-                    "gps": list(r['gps']) if r.get('gps') else None,
-                    "scene": r.get('scene'),
-                    "setting": r.get('setting'),
-                    "flash": r.get('flash'),
+                    "comment":    r.get('comment') or "—",
+                    "tags":       r.get('tags'),
+                    "raw_date":   r.get('raw_date'),
+                    "gps":        list(r['gps']) if r.get('gps') else None,
+                    "scene":      r.get('scene'),
+                    "setting":    r.get('setting'),
+                    "flash":      r.get('flash'),
                 })
 
     if review_queue_accumulator is not None:
@@ -1558,30 +1744,71 @@ def _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, 
     total          = len(files)
     backs_consumed = len(processed_files)
     reviewed       = len(review_queue)
-    written        = max(0, total - backs_consumed - reviewed - no_date_count - cutoff_skip_count)
+    # "date_written" is the strict count of photos that got a DateTimeOriginal.
+    # tagged_no_date_count photos also had metadata written (description/keywords/etc.)
+    # but without a date, so we surface them in their own bucket rather than rolling
+    # them into "written" or "nothing".
+    date_written   = max(0, total - backs_consumed - reviewed - tagged_no_date_count - nothing_written_count - cutoff_skip_count)
 
     # Accumulate into the batch-wide counters when in recursive mode
     if batch_totals is not None:
-        batch_totals['written']      += written
-        batch_totals['reviewed']     += reviewed
-        batch_totals['no_date']      += no_date_count
-        batch_totals['cutoff_skip']  += cutoff_skip_count
-        batch_totals['backs']        += backs_consumed
-        batch_totals['scanned']      += total
+        batch_totals['date_written']      += date_written
+        batch_totals['tagged_no_date']    += tagged_no_date_count
+        batch_totals['nothing_written']   += nothing_written_count
+        batch_totals['reviewed']          += reviewed
+        batch_totals['cutoff_skip']       += cutoff_skip_count
+        batch_totals['backs']             += backs_consumed
+        batch_totals['scanned']           += total
 
-    summary_lines = [f"[bold green]{written} written[/bold green]  of {total} scanned"]
+    summary_lines = [f"[bold green]{date_written} dated[/bold green]  of {total} scanned"]
+    if tagged_no_date_count:
+        summary_lines.append(f"[green]{tagged_no_date_count} tagged (no date)[/green]")
     if backs_consumed:
         summary_lines.append(f"[dim]{backs_consumed} back-of-photo consumed[/dim]")
     if cutoff_skip_count:
         summary_lines.append(f"[dim]{cutoff_skip_count} skipped (after cutoff)[/dim]")
     if reviewed:
         summary_lines.append(f"[yellow]{reviewed} queued for review[/yellow]")
-    if no_date_count:
-        summary_lines.append(f"[dim]{no_date_count} no date found[/dim]")
+    if nothing_written_count:
+        summary_lines.append(f"[red]{nothing_written_count} nothing written[/red]")
     console.print(f"\n  {' · '.join(summary_lines)}")
 
+    return {
+        'scanned':        total,
+        'date_written':   date_written,
+        'tagged_no_date': tagged_no_date_count,
+        'nothing_written': nothing_written_count,
+        'reviewed':       reviewed,
+        'cutoff_skip':    cutoff_skip_count,
+        'backs':          backs_consumed,
+    }
 
-def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False, recursive=False, folder_consensus=False, dry_run=False, skip_dated=False):
+
+def _print_run_complete_panel(bt: dict) -> None:
+    """Render the 'Run Complete' summary panel from a batch-totals dict.
+
+    Used by both the recursive multi-subfolder path and the non-recursive /
+    multi-folder paths so the layout is identical everywhere.
+    """
+    tbl = Table(show_header=False, box=None, padding=(0, 2))
+    tbl.add_column(style="dim", width=20)
+    tbl.add_column()
+    tbl.add_row("Total scanned",  str(bt['scanned']))
+    tbl.add_row("[green]Date written[/green]",        f"[green]{bt['date_written']}[/green]")
+    if bt.get('tagged_no_date'):
+        tbl.add_row("[green]Tagged (no date)[/green]", f"[green]{bt['tagged_no_date']}[/green]")
+    if bt.get('backs'):
+        tbl.add_row("[dim]Backs consumed[/dim]",      str(bt['backs']))
+    if bt.get('cutoff_skip'):
+        tbl.add_row("[dim]After cutoff[/dim]",        str(bt['cutoff_skip']))
+    if bt.get('reviewed'):
+        tbl.add_row("[yellow]Review queue[/yellow]",  f"[yellow]{bt['reviewed']}[/yellow]")
+    if bt.get('nothing_written'):
+        tbl.add_row("[red]Nothing written[/red]",     f"[red]{bt['nothing_written']}[/red]")
+    console.print(Panel(tbl, title="[bold]Run Complete[/bold]", border_style="cyan"))
+
+
+def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=False, enable_geo=False, recursive=False, folder_consensus=False, dry_run=False, skip_dated=False, geo_confidence_threshold=7):
     """Process a directory of photos. Returns the folder where review.json was
     written (or None if no review queue was produced), so the caller can offer
     an interactive review pass at end of run."""
@@ -1598,12 +1825,14 @@ def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=F
     if dry_run:         flags.append("DRY RUN")
     if skip_dated:      flags.append("skip-dated")
     flags_str = "  ".join(f"[cyan]{f}[/cyan]" for f in flags) if flags else "[dim]none[/dim]"
+    geo_line = f"\n[dim]Geo conf:[/dim]   ≥{geo_confidence_threshold}/10" if enable_geo else ""
     console.print(Panel.fit(
         f"[bold]Metadata-AI[/bold]\n\n"
         f"[dim]Folder:[/dim]     {folder}\n"
         f"[dim]Model:[/dim]      {MODEL_ID}\n"
         f"[dim]Cutoff:[/dim]     before {cutoff_year}\n"
-        f"[dim]Confidence:[/dim] ≥{confidence_threshold}/10\n"
+        f"[dim]Date conf:[/dim]   ≥{confidence_threshold}/10"
+        f"{geo_line}\n"
         f"[dim]Options:[/dim]    {flags_str}",
         border_style="cyan",
         title="[bold]Metadata-AI[/bold]",
@@ -1621,8 +1850,8 @@ def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=F
 
         accumulated_review_queue = []
         shared_durations = deque(maxlen=5)
-        batch_totals = {'scanned': 0, 'written': 0, 'reviewed': 0,
-                        'no_date': 0, 'cutoff_skip': 0, 'backs': 0}
+        batch_totals = {'scanned': 0, 'date_written': 0, 'tagged_no_date': 0,
+                        'nothing_written': 0, 'reviewed': 0, 'cutoff_skip': 0, 'backs': 0}
 
         global_offset = 0
         for subfolder, path_iter in groupby(all_paths, key=os.path.dirname):
@@ -1632,39 +1861,28 @@ def process_archive(folder, cutoff_year=2010, confidence_threshold=7, xmp_only=F
                             global_offset=global_offset, global_total=global_total, folder_consensus=folder_consensus,
                             root_folder=folder, dry_run=dry_run, skip_dated=skip_dated,
                             review_queue_accumulator=accumulated_review_queue,
-                            shared_durations=shared_durations, batch_totals=batch_totals)
+                            shared_durations=shared_durations, batch_totals=batch_totals,
+                            geo_confidence_threshold=geo_confidence_threshold)
             global_offset += len(subfolder_files)
 
         # Single combined report at the run root.
         write_review_report(folder, accumulated_review_queue)
-
-        # Batch summary panel
-        bt = batch_totals
-        tbl = Table(show_header=False, box=None, padding=(0, 2))
-        tbl.add_column(style="dim", width=16)
-        tbl.add_column()
-        tbl.add_row("Total scanned",  str(bt['scanned']))
-        tbl.add_row("[green]Written[/green]",       f"[green]{bt['written']}[/green]")
-        if bt['backs']:
-            tbl.add_row("[dim]Backs consumed[/dim]", str(bt['backs']))
-        if bt['cutoff_skip']:
-            tbl.add_row("[dim]After cutoff[/dim]",   str(bt['cutoff_skip']))
-        if bt['reviewed']:
-            tbl.add_row("[yellow]Review queue[/yellow]",   f"[yellow]{bt['reviewed']}[/yellow]")
-        if bt['no_date']:
-            tbl.add_row("[dim]No date found[/dim]",  str(bt['no_date']))
-        console.print(Panel(tbl, title="[bold]Run Complete — Batch Total[/bold]", border_style="cyan"))
+        _print_run_complete_panel(batch_totals)
 
         if not dry_run:
             _clear_checkpoint(folder)
-        return folder if accumulated_review_queue else None
+        review_folder = folder if accumulated_review_queue else None
+        return review_folder, batch_totals
 
     files = natsorted([f for f in os.listdir(folder) if f.lower().endswith(EXTENSIONS)])
-    _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo, folder_consensus=folder_consensus, dry_run=dry_run, skip_dated=skip_dated)
+    counters = _process_folder(folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo,
+                    folder_consensus=folder_consensus, dry_run=dry_run, skip_dated=skip_dated,
+                    geo_confidence_threshold=geo_confidence_threshold)
+    _print_run_complete_panel(counters)
     if not dry_run:
         _clear_checkpoint(folder)
-    # Return the folder if a review.json was written (i.e. there were skipped items)
-    return folder if os.path.exists(_review_json_path(folder)) else None
+    review_folder = folder if os.path.exists(_review_json_path(folder)) else None
+    return review_folder, counters
 
 
 # ---------------------------------------------------------------------------
@@ -1706,7 +1924,7 @@ Rules:
   use a descriptive title like "1970s Family Footage" or "Summer 1965 Vacation"; otherwise none
 - DESCRIPTION: one sentence describing the video
 - KEYWORDS: 5-8 lowercase keywords, comma-separated
-- LOCATION: specific city or place if clearly identifiable, otherwise none
+- LOCATION: specific city or place if clearly identifiable and you have at least 8/10 confidence (visible sign, recognisable landmark, or distinctive architecture); otherwise none — do not guess from general landscape appearance
 - GENRE: pick exactly one from this list:
     Home Movie - personal or family footage without a formal production
     Family - family events, gatherings, milestones
@@ -1729,7 +1947,7 @@ Summary:
 # ---------------------------------------------------------------------------
 def _video_get_duration(video_path):
     """Return video duration in seconds via ffprobe."""
-    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", video_path]
+    cmd = [_resolve_binary("ffprobe"), "-v", "quiet", "-print_format", "json", "-show_format", video_path]
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return float(json.loads(result.stdout)["format"]["duration"])
 
@@ -1755,7 +1973,7 @@ def _video_extract_frames(video_path, interval, out_dir):
     fps_str = f"1/{int(effective_interval)}"
 
     cmd = [
-        "ffmpeg", "-y", "-i", video_path,
+        _resolve_binary("ffmpeg"), "-y", "-i", video_path,
         "-vf", f"fps={fps_str}",
         "-q:v", "3",
         pattern,
@@ -1925,7 +2143,7 @@ def _video_write_metadata(video_path, metadata, summary):
         if val:
             meta_args += ["-metadata", f"{key}={val}"]
 
-    cmd = ["ffmpeg", "-y", "-i", video_path, "-c", "copy", *meta_args, tmp_path]
+    cmd = [_resolve_binary("ffmpeg"), "-y", "-i", video_path, "-c", "copy", *meta_args, tmp_path]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -2078,19 +2296,21 @@ if __name__ == "__main__":
             "  python metadata-ai.py                          # fully interactive\n"
             "  python metadata-ai.py /path/to/directory       # prompts for remaining options\n"
             "  python metadata-ai.py /path/to/directory -r --geotag --consensus\n"
-            "  python metadata-ai.py /path/to/directory --cutoff 1995 --confidence 6 --xmp-only"
+            "  python metadata-ai.py /path/to/directory --cutoff 1995 --date-confidence 6 --xmp-only"
         )
     )
     parser.add_argument("directory", nargs="?", default=None,
                         help="Path to directory containing photos or videos (prompted if omitted)")
     parser.add_argument("--cutoff", type=int, default=None, metavar="YEAR",
                         help="Skip photos dated from this year or later (default: 2010)")
-    parser.add_argument("--confidence", type=int, default=None, metavar="1-10",
-                        help="Confidence threshold for auto-write (default: 7)")
+    parser.add_argument("--date-confidence", type=int, default=None, metavar="1-10",
+                        help="Minimum date confidence required to write without review (default: 7)")
     parser.add_argument("--xmp-only", action="store_true", default=None,
                         help="Write metadata to XMP sidecar files only")
     parser.add_argument("--geotag", action="store_true", default=None,
                         help="Enable geotagging via Nominatim")
+    parser.add_argument("--geo-confidence", type=int, default=None, metavar="1-10",
+                        help="Minimum VLM location confidence required before geocoding (default: 7). Higher = stricter.")
     parser.add_argument("-r", "--recursive", action="store_true", default=None,
                         help="Recursively process all subfolders")
     parser.add_argument("--consensus", action="store_true", default=None,
@@ -2115,11 +2335,23 @@ if __name__ == "__main__":
         MODEL_ID = args.model
         console.print(f"[dim]Using model: {MODEL_ID}[/dim]")
 
+    import platform as _platform
+    _is_windows = _platform.system() == "Windows"
+
+    def _strip_shell_escapes(p: str) -> str:
+        """Remove bash/zsh backslash-escapes from a pasted path (e.g. /My\\ Folder).
+        Only applies on non-Windows systems — on Windows the backslash is the
+        path separator and must not be stripped.
+        """
+        if _is_windows:
+            return p
+        return re.sub(r'\\(.)', r'\1', p)
+
     # Directory or file — prompt if not provided
     if args.directory:
-        input_path = re.sub(r'\\(.)', r'\1', args.directory.strip())
+        input_path = _strip_shell_escapes(args.directory.strip())
     else:
-        input_path = re.sub(r'\\(.)', r'\1', _ask("Directory or file path", default=DIRECTORY)) or DIRECTORY
+        input_path = _strip_shell_escapes(_ask("Directory or file path", default=DIRECTORY)) or DIRECTORY
 
     # ── Review-only mode ────────────────────────────────────────────────────
     if args.review:
@@ -2146,7 +2378,7 @@ if __name__ == "__main__":
             folder = os.path.dirname(input_path) or "."
             filename = os.path.basename(input_path)
             cutoff_year = args.cutoff if args.cutoff is not None else 2010
-            confidence_threshold = args.confidence if args.confidence is not None else 7
+            confidence_threshold = args.date_confidence if args.date_confidence is not None else 7
             xmp_only = args.xmp_only or False
             enable_geo = args.geotag or False
             _process_folder(folder, [filename], cutoff_year, confidence_threshold,
@@ -2183,6 +2415,29 @@ if __name__ == "__main__":
                 process_video(os.path.join(directory, vf), video_interval)
             sys.exit(0)
 
+    # ── Multi-folder batch mode ──────────────────────────────────────────────
+    # After the first folder is selected, offer to add more so the user can
+    # batch-process several folders in one session with shared settings.
+    # Only offered in interactive mode (stdin is a tty) to keep scripted runs
+    # behaving identically.
+    directories = [directory]
+    if sys.stdin.isatty():
+        while _yn_select("Add another folder to this batch?", default_yes=False):
+            extra = _ask("Path to additional folder", "")
+            extra = _strip_shell_escapes(extra.strip()) if extra else ""
+            if not extra:
+                continue
+            if not os.path.isdir(extra):
+                console.print(f"  [yellow]⚠ Not a directory — ignored: {extra}[/yellow]")
+                continue
+            if extra in directories:
+                console.print(f"  [dim]Already in batch — ignored: {extra}[/dim]")
+                continue
+            directories.append(extra)
+            console.print(f"  [green]✓[/green] Added: {extra}  [dim]({len(directories)} folder(s) in batch)[/dim]")
+        if len(directories) > 1:
+            console.print(f"\n[bold]Batch:[/bold] [cyan]{len(directories)}[/cyan] folder(s) — settings below will apply to all of them.\n")
+
     # ── Photo mode ───────────────────────────────────────────────────────────
     if args.cutoff is not None:
         cutoff_year = args.cutoff
@@ -2193,10 +2448,10 @@ if __name__ == "__main__":
             console.print("[dim]Invalid year — defaulting to 2010.[/dim]")
             cutoff_year = 2010
 
-    if args.confidence is not None:
-        confidence_threshold = args.confidence
+    if args.date_confidence is not None:
+        confidence_threshold = args.date_confidence
     else:
-        raw = _ask("Confidence threshold for auto-write (1-10)", "7")
+        raw = _ask("Date confidence threshold (1-10)", "7")
         try:    confidence_threshold = int(raw)
         except: confidence_threshold = 7
 
@@ -2209,6 +2464,21 @@ if __name__ == "__main__":
         enable_geo = args.geotag
     else:
         enable_geo = _yn_select("Enable geotagging?")
+
+    # Geo confidence is only meaningful when geotagging is enabled.
+    # Default 7 matches the photo confidence default — high enough to filter
+    # landscape guesses, low enough to accept clear architectural cues.
+    if enable_geo:
+        if args.geo_confidence is not None:
+            geo_confidence_threshold = args.geo_confidence
+        else:
+            raw = _ask("Location confidence threshold (1-10, higher = stricter)", "7")
+            try:
+                geo_confidence_threshold = max(1, min(10, int(raw)))
+            except ValueError:
+                geo_confidence_threshold = 7
+    else:
+        geo_confidence_threshold = 7
 
     if args.recursive is not None:
         recursive = args.recursive
@@ -2224,24 +2494,57 @@ if __name__ == "__main__":
         console.print("\n[bold yellow]⚠ DRY RUN MODE — no files will be modified.[/bold yellow]\n")
 
     if not args.dry_run:
-        progress_file = _checkpoint_path(directory)
-        if os.path.exists(progress_file):
-            with open(progress_file) as pf:
-                completed_count = sum(1 for line in pf if line.strip())
-            if not _yn(f"Found a previous session with {completed_count} completed file(s). Resume?", default_yes=True):
-                _clear_checkpoint(directory)
-                console.print("[dim]Starting fresh.[/dim]\n")
-            else:
-                console.print("[dim]Resuming previous session.[/dim]\n")
-
-    review_folder = process_archive(directory, cutoff_year, confidence_threshold, xmp_only, enable_geo, recursive, folder_consensus, dry_run=args.dry_run, skip_dated=args.skip_dated)
-
-    if review_folder and not args.dry_run:
-        data = _load_review_json(review_folder)
-        if data:
-            pending_count = sum(1 for i in data.get("items", []) if i.get("status") == "pending")
-            if pending_count:
-                if _yn(f"[cyan]{pending_count}[/cyan] photo(s) need review. Run interactive review now?"):
-                    run_review_pass(review_folder, xmp_only=xmp_only)
+        for d in directories:
+            progress_file = _checkpoint_path(d)
+            if os.path.exists(progress_file):
+                with open(progress_file, encoding='utf-8') as pf:
+                    completed_count = sum(1 for line in pf if line.strip())
+                hint = f" ({d})" if len(directories) > 1 else ""
+                if not _yn(f"Found a previous session with {completed_count} completed file(s){hint}. Resume?", default_yes=True):
+                    _clear_checkpoint(d)
+                    console.print(f"[dim]Starting fresh for {d}.[/dim]\n")
                 else:
-                    console.print(f"[dim]Run later with:[/dim] [cyan]python metadata-ai.py {shlex.quote(review_folder)} --review[/cyan]")
+                    console.print(f"[dim]Resuming previous session{hint}.[/dim]\n")
+
+    review_folders = []
+    all_counters = []
+    for d in directories:
+        review_folder, counters = process_archive(
+            d, cutoff_year, confidence_threshold, xmp_only, enable_geo, recursive,
+            folder_consensus, dry_run=args.dry_run, skip_dated=args.skip_dated,
+            geo_confidence_threshold=geo_confidence_threshold,
+        )
+        if review_folder:
+            review_folders.append(review_folder)
+        all_counters.append(counters)
+
+    # When more than one top-level folder was processed, show a combined totals
+    # panel so the user has one at-a-glance summary for the whole batch.
+    if len(directories) > 1:
+        combined = {k: sum(c.get(k, 0) for c in all_counters)
+                    for k in ('scanned', 'date_written', 'tagged_no_date',
+                              'nothing_written', 'reviewed', 'cutoff_skip', 'backs')}
+        console.print()
+        _print_run_complete_panel(combined)
+
+    # End-of-run review prompt — works across multiple folders.
+    if review_folders and not args.dry_run:
+        total_pending = 0
+        for rf in review_folders:
+            data = _load_review_json(rf)
+            if data:
+                total_pending += sum(1 for i in data.get("items", []) if i.get("status") == "pending")
+        if total_pending:
+            label = f"[cyan]{total_pending}[/cyan] photo(s) need review across [cyan]{len(review_folders)}[/cyan] folder(s)" if len(review_folders) > 1 else f"[cyan]{total_pending}[/cyan] photo(s) need review"
+            if _yn(f"{label}. Run interactive review now?"):
+                for rf in review_folders:
+                    if len(review_folders) > 1:
+                        console.print(f"\n[bold cyan]📁 {rf}[/bold cyan]")
+                    run_review_pass(rf, xmp_only=xmp_only)
+            else:
+                if len(review_folders) == 1:
+                    console.print(f"[dim]Run later with:[/dim] [cyan]python metadata-ai.py {_quote_path(review_folders[0])} --review[/cyan]")
+                else:
+                    console.print(f"[dim]Run later with --review on each folder:[/dim]")
+                    for rf in review_folders:
+                        console.print(f"  [cyan]python metadata-ai.py {_quote_path(rf)} --review[/cyan]")
