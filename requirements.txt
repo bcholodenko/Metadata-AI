@@ -13,7 +13,27 @@ questionary
 geopy
 
 # Optional — raw camera format support: Canon CR2/CR3, Nikon NEF, Sony ARW, Fuji RAF, Olympus ORF, Panasonic RW2
-# rawpy
+# Install libheif first (brew install libheif / apt install libheif-dev), then:
+# pip install rawpy
 
 # Optional — extra OCR pass on backs of photos (VLM handles this without it)
-# pytesseract
+# pip install pytesseract
+# Requires Tesseract to be installed separately: https://tesseract-ocr.github.io/tessdoc/Installation.html
+
+# ── Notes ──────────────────────────────────────────────────────────────────
+#
+# pillow-heif requires libheif to be installed on your system:
+#   macOS:  brew install libheif
+#   Linux:  apt install libheif-dev
+#   Windows: download from https://github.com/strukturag/libheif/releases
+#            If HEIC support isn't needed, comment out pillow-heif above.
+#
+# ExifTool must be installed separately — it is not a Python package:
+#   macOS/Linux: https://exiftool.org  (or: brew install exiftool)
+#   Windows:     https://exiftool.org  — rename exiftool(-k).exe to exiftool.exe
+#                and place it on your PATH
+#
+# ffmpeg is required for video analysis only:
+#   macOS:  brew install ffmpeg
+#   Linux:  apt install ffmpeg
+#   Windows: https://ffmpeg.org/download.html
