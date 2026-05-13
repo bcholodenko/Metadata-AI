@@ -2,7 +2,7 @@
 
 Metadata-AI tags and dates your scanned photos and videos automatically. Point it at a folder of scans and it figures out roughly when each photo was taken, what's in it, and where it was — then writes that information into the file so any photo app can use it.
 
-It runs entirely on your own computer using a local AI model. Nothing gets uploaded anywhere.
+It runs entirely on your own computer using a local AI model. Nothing gets uploaded anywhere. Works on macOS, Linux, and Windows.
 
 ---
 
@@ -25,16 +25,24 @@ When the AI isn't sure about a date, it skips writing metadata for that photo an
 
 ### What you need
 
-- **Python 3.8 or newer**
+- **Python 3.9 or newer**
 - **[LM Studio](https://lmstudio.ai)** — runs the AI model locally
 - **[ExifTool](https://exiftool.org)** — writes metadata into your photos
 - **ffmpeg** — only if you want to analyze videos
 
-On macOS:
-
+**macOS**
 ```sh
 brew install exiftool ffmpeg libheif
 ```
+
+**Linux (Debian/Ubuntu)**
+```sh
+sudo apt install exiftool ffmpeg libheif-dev
+```
+
+**Windows**
+
+Download and install [ExifTool](https://exiftool.org) and [ffmpeg](https://ffmpeg.org/download.html) and make sure both are on your `PATH`. If you want HEIC support, install [libheif](https://github.com/strukturag/libheif/releases) as well.
 
 ### Install
 
@@ -56,7 +64,7 @@ The simplest way is to just run it and answer the prompts:
 python metadata-ai.py
 ```
 
-You'll be asked which folder to process, what cutoff year to use, and a few yes/no questions about what to enable — all with arrow-key selection menus.
+You'll be walked through a short setup — folder selection, cutoff year, and a few yes/no questions — using arrow-key selection menus. After selecting your first folder, you'll be offered the option to add more folders to process as a single batch with shared settings.
 
 If you'd rather skip the prompts:
 
@@ -72,12 +80,13 @@ Any flag you omit will be prompted for.
 | --- | --- |
 | `--recursive` (or `-r`) | Process every subfolder, not just the top one |
 | `--geotag` | Try to identify locations and add GPS coordinates |
+| `--geo-confidence 1-10` | How certain the AI must be before writing a location (default: 7) |
 | `--consensus` | Use the most common date in a folder to fix uncertain estimates from the same folder |
 | `--review` | Step through previously skipped photos and decide each one |
 | `--dry-run` | Show what would be written without changing anything |
 | `--skip-dated` | Skip photos that already have a date set |
 | `--cutoff YEAR` | Skip photos from this year or later (default: 2010) |
-| `--confidence 1-10` | How sure the AI has to be before writing a date (default: 7) |
+| `--date-confidence 1-10` | How sure the AI has to be before writing a date (default: 7) |
 
 ### Tip: the back of the photo
 
