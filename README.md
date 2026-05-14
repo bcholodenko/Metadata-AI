@@ -19,6 +19,8 @@ For videos, it samples frames at regular intervals, builds a written summary of 
 
 When the AI isn't sure about a date, it skips writing metadata for that photo and adds it to a review queue instead. At the end of the run you'll be asked whether to walk through those photos one by one in the terminal, with thumbnails of each one shown in a `review.html` file you can keep open in your browser.
 
+At the end of every run, a `metadata-ai-report.html` file is written to the root folder with a full summary: photos by decade, top keywords, places identified, per-folder breakdown, and run settings.
+
 ---
 
 ## Getting started
@@ -88,6 +90,10 @@ Any flag you omit will be prompted for.
 | `--cutoff YEAR` | Skip photos from this year or later (default: 2010) |
 | `--date-confidence 1-10` | How sure the AI has to be before writing a date (default: 7) |
 
+### Tip: pausing a run
+
+Type `p` and press Enter at any point to pause between photos. The current photo finishes before pausing. Press Enter again to resume, or Ctrl-C to stop — your progress is saved and the run can be resumed.
+
 ### Tip: the back of the photo
 
 If you scanned both sides of your prints, save them so the back comes right after the front in filename order — like `img001.jpg` (front) and `img002.jpg` (back). Metadata-AI will pair them automatically and read any handwritten dates or notes.
@@ -95,6 +101,10 @@ If you scanned both sides of your prints, save them so the back comes right afte
 ### Tip: name your folders well
 
 If your folder is called something like `Christmas 1978`, `Summer Vacation`, or `8-79`, the tool will use that as a strong hint. Generic folders like `New Folder (2)` or `Scans_Batch_3` are ignored.
+
+### Tip: adding files mid-run
+
+In recursive mode, if new photos are copied into a subfolder that hasn't been reached yet, they'll be picked up automatically — the tool rescans each folder from disk just before processing it.
 
 ---
 
@@ -104,6 +114,19 @@ If your folder is called something like `Christmas 1978`, `Summer Vacation`, or 
 - **`review.html`** is a dark-mode visual gallery of every pending photo, with thumbnails embedded inline. Open it in your browser to see what's queued up while you walk through decisions in the terminal. It updates as you go.
 - **`--dry-run`** lets you preview a whole run without changing anything.
 - **Resume support** is built in. If a long run gets interrupted, you can pick up where you left off.
+
+---
+
+## Output files
+
+Each run writes several files to the folder it processed:
+
+| File | What it contains |
+| --- | --- |
+| `metadata-ai-report.html` | Run summary: photos by decade, top keywords, places, per-folder breakdown, settings |
+| `review.html` | Dark-mode gallery of photos that need review, with embedded thumbnails |
+| `review.json` | Machine-readable review queue, updated as you make decisions |
+| `.metadata-ai-progress` | Internal resume checkpoint, deleted when the run completes cleanly |
 
 ---
 
