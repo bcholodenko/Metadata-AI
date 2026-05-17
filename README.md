@@ -1,148 +1,262 @@
 <img width="600" alt="logo" src="https://github.com/user-attachments/assets/8bcf39fd-93c3-4017-96e0-7d692237b197" />
 
-Metadata-AI tags and dates your scanned photos and videos automatically. Point it at a folder of scans and it figures out roughly when each photo was taken, what's in it, and where it was — then writes that information into the file so any photo app can use it.
+Automatically tag and date scanned photos and home videos using a **local vision-language model (VLM)** running in [LM Studio](https://lmstudio.ai). No data leaves your machine.
 
-It runs entirely on your own computer using a local AI model. Nothing gets uploaded anywhere. Works on macOS, Linux, and Windows.
-
----
-
-## What it does
-
-For each photo:
-
-- If you scanned the back of a print, it reads any handwritten dates and notes (translating them to English if needed).
-- It looks at clothing, hairstyles, technology, and setting to estimate when the photo was taken.
-- It writes a one-sentence description, five keywords, and tags whether the photo was indoor or outdoor and whether flash was used.
-- If you turn on geotagging, it tries to identify the location and look up GPS coordinates — but only when it can see something specific like a landmark or sign, not just a general landscape.
-
-For videos, it samples frames at regular intervals, builds a written summary of what's in the clip, and saves a title, description, keywords, location, and date into the video file.
-
-When the AI isn't sure about a date, it skips writing metadata for that photo and adds it to a review queue instead. At the end of the run you'll be asked whether to walk through those photos one by one in the terminal, with thumbnails of each one shown in a `review.html` file you can keep open in your browser.
-
-At the end of every run, a `metadata-ai-report.html` file is written to the root folder with a full summary: photos by decade, top keywords, places identified, per-folder breakdown, and run settings.
+Metadata-AI analyses each photo through a five-step pipeline — checking the back of the photo, existing IPTC keywords, and a VLM date estimate — then writes the result directly into the file's EXIF/XMP metadata or a sidecar. Low-confidence guesses are queued for a fast interactive review rather than written blindly.
 
 ---
 
-## Getting started
+## Features
 
-### What you need
+- **Automatic dating** — estimates photo dates from fashion, hairstyles, technology, and setting visible in the image; supports exact dates, decades, and fuzzy expressions like *"circa 1965"* or *"early 1980s"*
+- **Keyword tagging** — generates 5–8 descriptive keywords per photo and writes them as IPTC/XMP subject tags
+- **Scene description** — one-sentence scene summary stored in the image description field
+- **Indoor / outdoor detection** and **flash detection**
+- **Geotagging** — optional location identification via Nominatim (OpenStreetMap); confidence-gated to avoid landscape guesses
+- **Video analysis** — frame-by-frame VLM analysis with consensus dating, structured metadata, and an ffmpeg write-back
+- **Folder consensus** — low-confidence dates in a folder are corrected to the folder's majority year when a clear consensus exists
+- **Interactive review queue** — uncertain photos are written to `review.json` / `review.html` for a fast accept / edit / skip pass
+- **Resumable sessions** — a checkpoint file lets interrupted runs pick up exactly where they left off
+- **Dry-run mode** — preview every action without touching any file
+- **Batch processing** — process multiple folders in one run; recursive subfolder support
+- **XMP sidecar mode** — write `.xmp` files only, leaving originals untouched (always used for DNG and RAW files)
+- **RAW format support** — CR2, CR3, NEF, ARW, RAF, ORF, RW2, DNG (requires `rawpy`)
+- **Back-of-photo detection** — reads handwritten dates from the back of scanned prints via the VLM or optional Tesseract OCR
 
-- **Python 3.9 or newer**
-- **[LM Studio](https://lmstudio.ai)** — runs the AI model locally
-- **[ExifTool](https://exiftool.org)** — writes metadata into your photos
-- **ffmpeg** — only if you want to analyze videos
+---
 
-**macOS**
-```sh
-brew install exiftool ffmpeg libheif
+## Requirements
+
+### Python
+
+Python 3.10 or later.
+
+### Python packages
+
+```bash
+pip install -r requirements.txt
 ```
 
-**Linux (Debian/Ubuntu)**
-```sh
-sudo apt install exiftool ffmpeg libheif-dev
+Core dependencies installed automatically:
+
+| Package | Purpose |
+|---|---|
+| `openai` | LM Studio API client |
+| `Pillow` | Image loading and resizing |
+| `pillow-heif` | HEIC / HEIF support |
+| `iptcinfo3` | Existing IPTC keyword reading |
+| `natsort` | Natural filename ordering |
+| `rich` | Terminal UI (progress bars, panels) |
+
+Optional packages (uncomment in `requirements.txt` to enable):
+
+| Package | Feature unlocked |
+|---|---|
+| `geopy` | Geotagging via Nominatim (`--geotag`) |
+| `rawpy` + `numpy` | RAW camera file processing |
+| `questionary` | Arrow-key interactive menus |
+| `pytesseract` | OCR on photo backs |
+
+### External binaries
+
+**ExifTool** — merges XMP metadata into JPEG, TIFF, PNG, HEIC, and WebP files.
+
+```bash
+# macOS
+brew install exiftool
+
+# Ubuntu / Debian
+sudo apt install libimage-exiftool-perl
+
+# Windows — download installer from https://exiftool.org
 ```
 
-**Windows**
+**ffmpeg** — required for video frame extraction and metadata write-back.
 
-Download and install [ExifTool](https://exiftool.org) and [ffmpeg](https://ffmpeg.org/download.html) and make sure both are on your `PATH`. If you want HEIC support, install [libheif](https://github.com/strukturag/libheif/releases) as well.
+```bash
+# macOS
+brew install ffmpeg
 
-### Install
+# Ubuntu / Debian
+sudo apt install ffmpeg
 
-```sh
+# Windows — download from https://ffmpeg.org/download.html
+```
+
+### LM Studio
+
+1. Download and install [LM Studio](https://lmstudio.ai).
+2. Load a vision-capable model. The default is `qwen/qwen3.6-27b`; any OpenAI-compatible VLM works.
+3. Start the **Local Server** (default: `http://localhost:1234`).
+
+---
+
+## Installation
+
+```bash
 git clone https://github.com/bcholodenko/Metadata-AI.git
 cd Metadata-AI
 pip install -r requirements.txt
 ```
 
-Then open LM Studio, load a vision-capable model, and start its local server.
+---
+
+## Configuration
+
+Copy or edit `configuration.json` (all fields are optional — built-in defaults are used for anything omitted):
+
+```json
+{
+    "lm_studio": {
+        "url":   "http://localhost:1234/v1",
+        "model": "qwen/qwen3.6-27b"
+    },
+    "defaults": {
+        "directory":       "./photos",
+        "cutoff_year":     2010,
+        "date_confidence": 7,
+        "geo_confidence":  7
+    },
+    "limits": {
+        "vlm_max_dimension":  2048,
+        "max_image_pixels":   500000000,
+        "min_photo_year":     1826,
+        "min_video_year":     1888,
+        "max_year":           2100
+    }
+}
+```
+
+| Key | Description |
+|---|---|
+| `lm_studio.url` | Base URL of the LM Studio local server |
+| `lm_studio.model` | Model ID as shown in LM Studio |
+| `defaults.cutoff_year` | Photos from this year or later are skipped (they're probably already dated) |
+| `defaults.date_confidence` | Minimum VLM confidence (1–10) to write a date without queuing for review |
+| `defaults.geo_confidence` | Minimum confidence to accept a location guess and geocode it |
+| `limits.vlm_max_dimension` | Longest image side (px) sent to the VLM — larger images are downscaled |
 
 ---
 
-## Using it
+## Usage
 
-The simplest way is to just run it and answer the prompts:
+### Fully interactive (recommended for first use)
 
-```sh
+```bash
 python metadata-ai.py
 ```
 
-You'll be walked through a short setup — folder selection, cutoff year, and a few yes/no questions — using arrow-key selection menus. After selecting your first folder, you'll be offered the option to add more folders to process as a single batch with shared settings.
+You will be prompted for the directory, cutoff year, confidence threshold, and feature flags.
 
-If you'd rather skip the prompts:
+### Supply the directory, prompt for the rest
 
-```sh
-python metadata-ai.py /path/to/photos --recursive --geotag --consensus
+```bash
+python metadata-ai.py /path/to/scanned/photos
 ```
 
-Any flag you omit will be prompted for.
+### Non-interactive / scripted
 
-### Useful flags
+```bash
+# Recursive, geotagging on, folder-consensus year correction
+python metadata-ai.py /path/to/photos -r --geotag --consensus
 
-| Flag | What it does |
-| --- | --- |
-| `--recursive` (or `-r`) | Process every subfolder, not just the top one |
-| `--geotag` | Try to identify locations and add GPS coordinates |
-| `--geo-confidence 1-10` | How certain the AI must be before writing a location (default: 7) |
-| `--consensus` | Use the most common date in a folder to fix uncertain estimates from the same folder |
-| `--review` | Step through previously skipped photos and decide each one |
-| `--dry-run` | Show what would be written without changing anything |
-| `--skip-dated` | Skip photos that already have a date set |
-| `--cutoff YEAR` | Skip photos from this year or later (default: 2010) |
-| `--date-confidence 1-10` | How sure the AI has to be before writing a date (default: 7) |
+# Strict confidence, XMP sidecars only, dry run first
+python metadata-ai.py /path/to/photos --cutoff 1995 --date-confidence 8 --xmp-only --dry-run
 
-### Tip: pausing a run
+# Single file
+python metadata-ai.py /path/to/photo.jpg
 
-Type `p` and press Enter at any point to pause between photos. The current photo finishes before pausing. Press Enter again to resume, or Ctrl-C to stop — your progress is saved and the run can be resumed.
+# Video file
+python metadata-ai.py /path/to/video.mp4 --video-interval 30
+```
 
-### Tip: the back of the photo
+### CLI reference
 
-If you scanned both sides of your prints, save them so the back comes right after the front in filename order — like `img001.jpg` (front) and `img002.jpg` (back). Metadata-AI will pair them automatically and read any handwritten dates or notes.
+```
+positional arguments:
+  directory             Path to a directory or single file (prompted if omitted)
 
-### Tip: name your folders well
-
-If your folder is called something like `Christmas 1978`, `Summer Vacation`, or `8-79`, the tool will use that as a strong hint. Generic folders like `New Folder (2)` or `Scans_Batch_3` are ignored.
-
-### Tip: adding files mid-run
-
-In recursive mode, if new photos are copied into a subfolder that hasn't been reached yet, they'll be picked up automatically — the tool rescans each folder from disk just before processing it.
+options:
+  --cutoff YEAR         Skip photos from this year or later (default: 2010)
+  --date-confidence 1-10
+                        Minimum date confidence to write without review (default: 7)
+  --xmp-only            Write XMP sidecar files only; skip ExifTool merge
+  --geotag              Enable geotagging via Nominatim
+  --geo-confidence 1-10
+                        Minimum location confidence before geocoding (default: 7)
+  -r, --recursive       Recursively process all subfolders
+  --consensus           Use folder consensus year to correct low-confidence dates
+  --dry-run             Preview actions without modifying any files
+  --skip-dated          Skip photos that already have a DateTimeOriginal tag
+  --review              Run interactive review for pending items in review.json
+  --model MODEL         LM Studio model ID to use
+  --video-interval SEC  Seconds between sampled frames for video analysis (default: 30)
+  --output PATH         Output .txt path for video analysis report
+```
 
 ---
 
-## What if it gets something wrong?
+## How It Works
 
-- **Interactive review at the end of the run.** When the AI isn't confident about a photo's date, it's skipped rather than given a wrong one. At the end of the run, you'll be offered an interactive review pass: each pending photo is shown with the AI's guess, and you can accept it, enter a different date, or skip the photo permanently. Decisions are saved as you go, so you can quit and resume anytime with `--review`.
-- **`review.html`** is a dark-mode visual gallery of every pending photo, with thumbnails embedded inline. Open it in your browser to see what's queued up while you walk through decisions in the terminal. It updates as you go.
-- **`--dry-run`** lets you preview a whole run without changing anything.
-- **Resume support** is built in. If a long run gets interrupted, you can pick up where you left off.
+Each photo passes through a five-step pipeline:
+
+1. **Back-of-photo detection** — if the next file in filename order appears to be a scanned back (handwriting, no scene), its text is read via the VLM (or Tesseract OCR if installed) and parsed for a date.
+2. **IPTC keyword check** — existing keywords are scanned for parseable dates, which are used directly if found.
+3. **VLM date estimation** — the image is sent to the local VLM with a prompt asking it to estimate the date from visual cues (fashion, technology, setting). A second call extracts time of day, scene description, setting, flash, location, and keywords.
+4. **Location resolution** — if geotagging is enabled and the VLM identified a specific location with sufficient confidence, Nominatim converts it to GPS coordinates.
+5. **Write decision** — dates at or above the confidence threshold are written immediately; dates below threshold (or with no date at all) are added to the review queue.
+
+After all photos in a folder are processed, an optional **consensus pass** can rewrite low-confidence dates to the folder's majority year when a clear majority exists (more than 50% of high-confidence results agree).
+
+### Review queue
+
+Photos that cannot be dated confidently are written to `review.json` and a dark-mode `review.html` (with thumbnails) inside the processed folder. Run the interactive review at any time:
+
+```bash
+python metadata-ai.py /path/to/photos --review
+```
+
+Each photo offers four choices: **accept** the AI's guess, **enter** a different date, **skip** permanently, or **quit** (progress is saved and the session can be resumed).
+
+### Supported formats
+
+**Photos:** JPEG, TIFF, PNG, HEIC, WebP, DNG, CR2, CR3, NEF, ARW, RAF, ORF, RW2, RAW
+
+**Videos:** MP4, MOV, AVI, M4V, MKV, MTS, M2TS, WMV, FLV, WebM
 
 ---
 
 ## Output files
 
-Each run writes several files to the folder it processed:
-
-| File | What it contains |
-| --- | --- |
-| `metadata-ai-report.html` | Run summary: photos by decade, top keywords, places, per-folder breakdown, settings |
-| `review.html` | Dark-mode gallery of photos that need review, with embedded thumbnails |
-| `review.json` | Machine-readable review queue, updated as you make decisions |
-| `.metadata-ai-progress` | Internal resume checkpoint, deleted when the run completes cleanly |
+| File | Description |
+|---|---|
+| `review.json` | Machine-readable review queue for the folder |
+| `review.html` | Browser-viewable review page with thumbnails and status indicators |
+| `metadata-ai-report.html` | Dark-mode run summary: decade chart, keyword cloud, top locations, per-folder stats |
+| `<video>_summary.txt` | Plain-text frame-by-frame analysis and summary for video files |
+| `.metadata-ai-progress` | Checkpoint file used to resume interrupted runs (auto-deleted on completion) |
+| `*.xmp` | XMP sidecar files (created for RAW/DNG files, or when `--xmp-only` is set) |
 
 ---
 
-## Supported file types
+## Tips
 
-| Type | Formats | How metadata is saved |
-| --- | --- | --- |
-| Photos | JPEG, PNG, TIFF, HEIC, WebP | XMP sidecar merged into the file via ExifTool |
-| Photos | DNG | XMP sidecar kept next to the file |
-| Camera raw | Canon CR2/CR3, Nikon NEF, Sony ARW, Fuji RAF, Olympus ORF, Panasonic RW2 | XMP sidecar kept next to the file (requires `pip install rawpy`) |
-| Videos | MP4, MOV, AVI, M4V, MKV, MTS, M2TS, WMV, FLV, WebM | Written directly into the file via ffmpeg |
-
-XMP sidecar files are read by Lightroom, Apple Photos, digiKam, and most photo management apps.
+- **Start with `--dry-run`** to see what would be written before committing to any changes.
+- **Set `--cutoff`** to the year your digital camera era begins — photos from that year onward are skipped because they already carry accurate EXIF dates.
+- **Lower `--date-confidence`** (e.g. `5`) to write more dates automatically; raise it (e.g. `9`) to send more photos to the review queue.
+- **Folder names help** — folders named `"Summer 1975"` or `"June 1962 Vacation"` are detected and passed to the VLM as high-confidence date/location hints.
+- **Use `--consensus`** for rolls of film or batches scanned from the same occasion — the VLM's majority opinion corrects outliers.
+- **RAW files always get XMP sidecars** regardless of the `--xmp-only` flag, since writing directly into RAW containers is unsafe.
+- **Pause mid-run** by typing `p` + Enter in the terminal; the current photo finishes before pausing. Press Enter to resume, or Ctrl-C to quit (checkpoint is saved).
 
 ---
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE) for details.
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome at [github.com/bcholodenko/Metadata-AI](https://github.com/bcholodenko/Metadata-AI)
