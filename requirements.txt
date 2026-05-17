@@ -1,39 +1,55 @@
-# Core requirements
+# Metadata-AI — Python dependencies
+# https://github.com/bcholodenko/Metadata-AI
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# Optional extras are listed at the bottom.
+
+# ── Core ─────────────────────────────────────────────────────────────────────
+
+# OpenAI-compatible client — used to talk to LM Studio's local API endpoint
+openai>=1.30.0
+
+# Image loading and processing
 Pillow>=10.0.0
-iptcinfo3
-natsort
-openai
-pillow-heif
-rich
 
-# Optional — interactive arrow-key prompts (falls back to plain text prompts without it)
-questionary
+# HEIC / HEIF image support (Apple Live Photos, iPhone exports)
+pillow-heif>=0.13.0
 
-# Optional — geotagging via Nominatim (only needed with --geotag)
-geopy
+# IPTC metadata reading (existing keyword extraction)
+iptcinfo3>=2.1.4
 
-# Optional — raw camera format support: Canon CR2/CR3, Nikon NEF, Sony ARW, Fuji RAF, Olympus ORF, Panasonic RW2
-# Install libheif first (brew install libheif / apt install libheif-dev), then:
-# pip install rawpy
+# Natural sort for filename ordering (e.g. img2 before img10)
+natsort>=8.4.0
 
-# Optional — extra OCR pass on backs of photos (VLM handles this without it)
-# pip install pytesseract
-# Requires Tesseract to be installed separately: https://tesseract-ocr.github.io/tessdoc/Installation.html
+# Rich terminal output: progress bars, panels, tables
+rich>=13.7.0
 
-# ── Notes ──────────────────────────────────────────────────────────────────
+# ── Optional — install for additional features ────────────────────────────────
+
+# Geotagging via Nominatim geocoding (--geotag flag)
+# geopy>=2.4.0
+
+# RAW camera file support (CR2, NEF, ARW, RAF, …)
+# rawpy>=0.19.0
+# numpy>=1.24.0        # rawpy dependency
+
+# Interactive arrow-key menus (falls back to numbered lists if absent)
+# questionary>=2.0.0
+
+# OCR text extraction from photo backs (Tesseract wrapper)
+# pytesseract>=0.3.10
+# Tesseract binary also required: https://github.com/tesseract-ocr/tesseract
+
+# ── External binaries (not pip-installable) ───────────────────────────────────
 #
-# pillow-heif requires libheif to be installed on your system:
-#   macOS:  brew install libheif
-#   Linux:  apt install libheif-dev
-#   Windows: download from https://github.com/strukturag/libheif/releases
-#            If HEIC support isn't needed, comment out pillow-heif above.
+# ExifTool  — writes metadata into JPEG/TIFF/PNG/HEIC/WebP files
+#   macOS:   brew install exiftool
+#   Ubuntu:  sudo apt install libimage-exiftool-perl
+#   Windows: https://exiftool.org
 #
-# ExifTool must be installed separately — it is not a Python package:
-#   macOS/Linux: https://exiftool.org  (or: brew install exiftool)
-#   Windows:     https://exiftool.org  — rename exiftool(-k).exe to exiftool.exe
-#                and place it on your PATH
-#
-# ffmpeg is required for video analysis only:
-#   macOS:  brew install ffmpeg
-#   Linux:  apt install ffmpeg
+# ffmpeg    — required for video frame extraction and metadata writing
+#   macOS:   brew install ffmpeg
+#   Ubuntu:  sudo apt install ffmpeg
 #   Windows: https://ffmpeg.org/download.html
