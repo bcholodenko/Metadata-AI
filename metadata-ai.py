@@ -10,6 +10,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import concurrent.futures
 from pathlib import Path
 from collections import Counter, deque
 from dataclasses import dataclass
@@ -52,25 +53,53 @@ console = Console()
 # Constants
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+def _load_config(path: str = "config.json") -> dict:
+    """Load config.json from the script's directory, returning defaults on any error."""
+    script_dir   = os.path.dirname(os.path.abspath(__file__))
+    config_path  = os.path.join(script_dir, path)
+    defaults = {
+        "lm_studio": {"url": "http://localhost:1234/v1", "model": "qwen/qwen3.6-27b"},
+        "defaults":  {"directory": "./photos", "cutoff_year": 2010,
+                      "date_confidence": 7, "geo_confidence": 7},
+        "limits":    {"vlm_max_dimension": 2048, "max_image_pixels": 500_000_000,
+                      "min_photo_year": 1826, "min_video_year": 1888, "max_year": 2100},
+    }
+    if not os.path.exists(config_path):
+        return defaults
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = json.load(f)
+        # Deep-merge: user values override defaults, missing keys fall back
+        for section, section_defaults in defaults.items():
+            if section not in data:
+                data[section] = section_defaults
+            else:
+                for key, val in section_defaults.items():
+                    data[section].setdefault(key, val)
+        return data
+    except Exception as e:
+        print(f"Warning: could not load config.json ({e}) — using defaults.", flush=True)
+        return defaults
+
+
+_CONFIG = _load_config()
+
 # Raise Pillow's decompression bomb limit to handle large scanned photos.
-# Scanned photos at 600-1200 DPI can easily exceed the default 89 MP threshold,
-# but we still want a guard against truly absurd or corrupt files.  500 MP covers
-# any realistic scan; resolution is also capped before sending to the VLM.
-Image.MAX_IMAGE_PIXELS = 500_000_000
+Image.MAX_IMAGE_PIXELS = _CONFIG["limits"]["max_image_pixels"]
 
-# Maximum long-edge pixel size sent to the VLM.  The model doesn't benefit from
-# full-resolution images and this avoids unnecessary memory use.
-VLM_MAX_DIMENSION = 2048
+VLM_MAX_DIMENSION = _CONFIG["limits"]["vlm_max_dimension"]
 
-# Plausible-year ranges used when validating parsed dates.
-MIN_PHOTO_YEAR = 1826  # earliest known photograph
-MIN_VIDEO_YEAR = 1888  # earliest known motion picture
-MAX_YEAR       = 2100
+MIN_PHOTO_YEAR = _CONFIG["limits"]["min_photo_year"]
+MIN_VIDEO_YEAR = _CONFIG["limits"]["min_video_year"]
+MAX_YEAR       = _CONFIG["limits"]["max_year"]
 
-# User-configurable defaults — override in LM Studio or via CLI flags.
-DIRECTORY = "./photos"          # Default folder when no path is supplied
-MODEL_ID  = "qwen/qwen3.6-27b" # Must match the model identifier in LM Studio
-CLIENT    = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
+DIRECTORY = _CONFIG["defaults"]["directory"]
+MODEL_ID  = _CONFIG["lm_studio"]["model"]
+CLIENT    = OpenAI(base_url=_CONFIG["lm_studio"]["url"], api_key="lm-studio")
 
 EXTENSIONS = (
     '.jpg', '.jpeg', '.tiff', '.tif', '.png', '.heic',
@@ -198,6 +227,23 @@ def _quote_path(p: str) -> str:
         return '"' + p.replace('"', '\\"') + '"'
     import shlex
     return shlex.quote(p)
+
+
+def _strip_shell_escapes(p: str) -> str:
+    """Remove bash/zsh backslash-escapes from a pasted path.
+
+    On Windows, backslashes are path separators and must not be removed, so
+    the string is returned unchanged.  On POSIX systems the shell typically
+    escapes spaces and special characters with a leading backslash; this
+    function strips those escape characters so the path resolves correctly.
+
+    Defined at module level (not inside ``__main__``) so it is available to
+    callers that import this module rather than running it directly.
+    """
+    import platform
+    if platform.system() == "Windows":
+        return p
+    return re.sub(r'\\(.)', r'\1', p)
 
 
 def _resolve_binary(name: str) -> str:
@@ -384,6 +430,26 @@ def check_for_pause():
     except EOFError:
         pass
     console.print("[bold green]▶  Resuming…[/bold green]\n")
+
+
+def _run_vlm_async(fn, *args, poll_interval=0.15, **kwargs):
+    """Run a VLM call in a background thread, polling for pause/interrupt.
+
+    Submits fn(*args, **kwargs) to a thread and returns its result.
+    While waiting, checks for pause/Ctrl-C every poll_interval seconds
+    so the user is not stuck waiting a full VLM round-trip before the
+    pause takes effect.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fn, *args, **kwargs)
+        while True:
+            try:
+                return future.result(timeout=poll_interval)
+            except concurrent.futures.TimeoutError:
+                check_for_pause()
+            except KeyboardInterrupt:
+                future.cancel()
+                raise
 
 
 # ---------------------------------------------------------------------------
@@ -1268,7 +1334,12 @@ def geolocate(location_text):
     global _LAST_GEOCODE_TIME
     if not location_text:
         return None
-    cache_key = location_text.strip().lower()
+    # Normalise before caching so "Paris", " paris ", and "PARIS" all share
+    # the same cache entry AND the same string is sent to Nominatim — fixing
+    # the previous mismatch where the cache key was lowercased but the geocode
+    # query used the original casing.
+    normalised = location_text.strip()
+    cache_key  = normalised.lower()
     if cache_key in _GEOCODE_CACHE:
         return _GEOCODE_CACHE[cache_key]
     try:
@@ -1279,7 +1350,7 @@ def geolocate(location_text):
         elapsed = time.monotonic() - _LAST_GEOCODE_TIME
         if elapsed < _GEOCODE_MIN_INTERVAL:
             time.sleep(_GEOCODE_MIN_INTERVAL - elapsed)
-        location = geolocator.geocode(location_text, timeout=10)
+        location = geolocator.geocode(normalised, timeout=10)
         _LAST_GEOCODE_TIME = time.monotonic()
         result = (location.latitude, location.longitude) if location else None
         _GEOCODE_CACHE[cache_key] = result
@@ -1359,11 +1430,16 @@ def _parse_time_of_day(text):
     if m:
         hour = int(m.group(1))
         ampm = m.group(3)
+        # Reject hours outside the valid 12-hour clock range (1–12).
+        # Silently clamping an impossible value like "13pm" to 23 would write
+        # wrong EXIF data; returning None is safer and keeps the field unset.
+        if not (1 <= hour <= 12):
+            return None
         if ampm == 'pm' and hour != 12:
             hour += 12
         elif ampm == 'am' and hour == 12:
             hour = 0
-        return min(hour, 23)
+        return hour  # guaranteed 0–23; no clamp needed after range check above
 
     m = re.search(r'\b(\d{1,2}):(\d{2})\b', text)
     if m:
@@ -1501,7 +1577,7 @@ def _try_back_of_photo(folder, files, i, processed_files):
         "DATE: <any date written on it in YYYY:MM:DD format, or 'circa 1950s', or 'none'>\n"
         "COMMENT: <any other handwritten or printed text excluding dates, translated to English, or 'none'>"
     )
-    back_resp    = ask_vlm(next_path, back_prompt)
+    back_resp    = _run_vlm_async(ask_vlm, next_path, back_prompt)
     is_back_line = re.search(r'IS_BACK:\s*([^\n]+)', back_resp or "")
     if not (is_back_line and is_back_line.group(1).strip().lower().startswith("yes")):
         console.print(f"      [dim]No back detected.[/dim]")
@@ -1523,7 +1599,7 @@ def _try_back_of_photo(folder, files, i, processed_files):
             "Extract any date from this text in YYYY:MM:DD format, or 'circa 1950s', etc. "
             "If no date, return 'none'."
         )
-        raw_date_str = ask_vlm(next_path, ocr_prompt).strip()
+        raw_date_str = _run_vlm_async(ask_vlm, next_path, ocr_prompt).strip()
 
     found_date, raw_date_text = parse_fuzzy_date(raw_date_str)
     if found_date:
@@ -1613,7 +1689,7 @@ def _vlm_estimate_date(image_path, folder_hint, cutoff_year, confidence_threshol
         "CONFIDENCE: <score 1-10>"
     )
     console.print(f"      [dim]Dating…[/dim]")
-    date_resp = ask_vlm(image_path, date_prompt, max_tokens=200) or ""
+    date_resp = _run_vlm_async(ask_vlm, image_path, date_prompt, max_tokens=200) or ""
     if not date_resp:
         console.print(f"      [yellow]⚠ VLM returned no response for date estimate.[/yellow]")
         return None, None, 0
@@ -1704,7 +1780,7 @@ def _vlm_describe_photo(image_path, folder_hint_loc, enable_geo):
     )
 
     console.print(f"      [dim]Describing…[/dim]")
-    resp = ask_vlm(image_path, desc_prompt) or ""
+    resp = _run_vlm_async(ask_vlm, image_path, desc_prompt) or ""
     if not resp:
         console.print(f"      [yellow]⚠ VLM returned no response — skipping description.[/yellow]")
 
@@ -1860,6 +1936,11 @@ def _apply_consensus_year(results, confidence_threshold):
     low-confidence photos go to the review queue rather than being silently
     force-aligned to a noisy mode.  This prevents incorrect mass-dating of
     rolls where the VLM is inconsistent across visually similar scenes.
+
+    Implementation note: the majority test is ``votes * 2 > total`` (integer
+    arithmetic).  This is equivalent to ``votes > total / 2`` but avoids
+    floating-point division.  A tie (``votes * 2 == total``) is intentionally
+    **not** treated as a majority — do not change ``>`` to ``>=``.
     """
     high_conf_years = [
         int(r['found_date'][:4])
@@ -1916,6 +1997,8 @@ def _process_folder(
     batch_totals=None,
     geo_confidence_threshold=7,
     run_log=None,
+    work_offset=0,
+    work_total=None,
 ):
     """Process one folder of photos through the full five-step pipeline.
 
@@ -1980,6 +2063,10 @@ def _process_folder(
     results         = []
     completed_paths = _load_checkpoint(root_folder or folder) if not dry_run else set()
 
+    # Silent-skip counters — flushed as one summary line when a real photo appears
+    checkpoint_skip_count = 0
+    skip_dated_count      = 0
+
     if dry_run and os.path.exists(_checkpoint_path(root_folder or folder)):
         console.print("   [dim]ℹ Dry-run: ignoring existing checkpoint, re-analyzing all files.[/dim]")
 
@@ -2015,6 +2102,19 @@ def _process_folder(
     )
     _eta_str = ""
 
+    # _work_pos and _work_total drive the [X/N] counter shown on each photo.
+    # work_offset is the count of real (non-skipped) photos processed in prior
+    # folders this run; work_total is the total remaining across the whole run.
+    # Both are computed once in process_archive and passed in so the counter
+    # never resets between folders.
+    already_done_in_run = len(completed_paths)
+    _work_total = work_total if work_total is not None else max(
+        (global_total - already_done_in_run) if global_total is not None
+        else sum(1 for f in files if os.path.join(folder, f) not in completed_paths),
+        1,
+    )
+    _work_pos = work_offset  # carries across folder boundaries
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold cyan]{task.description}"),
@@ -2035,35 +2135,40 @@ def _process_folder(
             check_for_pause()
 
             current_path = os.path.join(folder, current_file)
-            pos          = global_offset + i + 1
-            total_str    = str(global_total) if global_total else str(len(files))
             _photo_start = time.monotonic()
             progress.update(task, description=f"[bold cyan]{current_file}[/bold cyan]")
 
             if not os.path.isfile(current_path):
                 console.print(
-                    f"  [yellow]⚠ [{pos}/{total_str}] File no longer exists — "
-                    f"skipping: {current_file}[/yellow]"
+                    f"  [yellow]⚠ File no longer exists — skipping: {current_file}[/yellow]"
                 )
                 nothing_written_count += 1
                 progress.advance(task)
                 continue
 
             if current_path in completed_paths:
-                console.print(
-                    f"  [dim][{pos}/{total_str}] Already processed — skipping: {current_file}[/dim]"
-                )
+                checkpoint_skip_count += 1
                 progress.advance(task)
                 continue
 
             if skip_dated and _has_existing_date(current_path):
-                console.print(
-                    f"  [dim][{pos}/{total_str}] Already dated — skipping: {current_file}[/dim]"
-                )
+                skip_dated_count += 1
                 progress.advance(task)
                 continue
 
-            console.print(f"\n  [bold][{pos}/{total_str}][/bold] [cyan]{current_file}[/cyan]")
+            # Flush any accumulated silent skips before printing this photo's header
+            if checkpoint_skip_count or skip_dated_count:
+                parts = []
+                if checkpoint_skip_count:
+                    parts.append(f"{checkpoint_skip_count} already processed")
+                if skip_dated_count:
+                    parts.append(f"{skip_dated_count} already dated")
+                console.print(f"  [dim]⏩ Skipped {' + '.join(parts)}.[/dim]")
+                checkpoint_skip_count = 0
+                skip_dated_count      = 0
+
+            _work_pos += 1
+            console.print(f"\n  [bold][{_work_pos}/{_work_total}][/bold] [cyan]{current_file}[/cyan]")
             analysis = PhotoAnalysis()
 
             # Step 1: back-of-photo check
@@ -2220,9 +2325,7 @@ def _process_folder(
 
             # Rolling ETA update
             _durations.append(time.monotonic() - _photo_start)
-            photos_done  = global_offset + i + 1
-            photos_total = global_total if global_total is not None else len(files)
-            remaining    = max(0, photos_total - photos_done)
+            remaining = max(0, _work_total - _work_pos)
             if len(_durations) >= MIN_SAMPLES and remaining > 0:
                 avg_sec  = sum(_durations) / len(_durations)
                 _eta_str = f"[dim]{_format_eta(avg_sec * remaining)} remaining[/dim]"
@@ -2249,6 +2352,15 @@ def _process_folder(
                     'gps':        list(analysis.gps) if analysis.gps else None,
                     'geo_label':  geo_label,
                 })
+
+    # Flush any skips that accumulated in the final stretch of the folder
+    if checkpoint_skip_count or skip_dated_count:
+        parts = []
+        if checkpoint_skip_count:
+            parts.append(f"{checkpoint_skip_count} already processed")
+        if skip_dated_count:
+            parts.append(f"{skip_dated_count} already dated")
+        console.print(f"  [dim]⏩ Skipped {' + '.join(parts)}.[/dim]")
 
     # Folder consensus pass
     if folder_consensus and results:
@@ -2341,7 +2453,7 @@ def _process_folder(
         'reviewed':        reviewed,
         'cutoff_skip':     cutoff_skip_count,
         'backs':           backs_consumed,
-    }
+    }, _work_pos
 
 
 def _print_run_complete_panel(bt: dict) -> None:
@@ -2841,7 +2953,13 @@ def process_archive(
             'nothing_written': 0, 'reviewed': 0, 'cutoff_skip': 0, 'backs': 0,
         }
         global_offset        = 0
+        work_offset          = 0   # real (non-skipped) photos processed so far
         processed_subfolders: set[str] = set()
+
+        # Compute work_total once: files not yet in the checkpoint.
+        # Used by _process_folder to show [X/work_total] across the whole run.
+        _checkpoint = _load_checkpoint(folder) if not dry_run else set()
+        _run_work_total = max(initial_count - len(_checkpoint), 1)
 
         while True:
             for root, dirs, _ in os.walk(folder):
@@ -2890,7 +3008,7 @@ def process_archive(
                 f"\n[bold cyan]📁 {subfolder}[/bold cyan] "
                 f"[dim]({len(disk_files)} file(s) on disk)[/dim]"
             )
-            _process_folder(
+            _, new_work_pos = _process_folder(
                 subfolder, disk_files, cutoff_year, confidence_threshold, xmp_only, enable_geo,
                 global_offset=global_offset, global_total=live_global_total,
                 folder_consensus=folder_consensus,
@@ -2899,7 +3017,10 @@ def process_archive(
                 shared_durations=shared_durations, batch_totals=batch_totals,
                 geo_confidence_threshold=geo_confidence_threshold,
                 run_log=run_log,
+                work_offset=work_offset,
+                work_total=_run_work_total,
             )
+            work_offset    = new_work_pos
             global_offset += len(disk_files)
 
         write_review_report(folder, accumulated_review_queue)
@@ -2915,11 +3036,15 @@ def process_archive(
         return review_folder, batch_totals
 
     files    = natsorted([f for f in os.listdir(folder) if f.lower().endswith(EXTENSIONS)])
-    counters = _process_folder(
+    _nr_checkpoint  = _load_checkpoint(folder) if not dry_run else set()
+    _nr_work_total  = max(len(files) - len(_nr_checkpoint), 1)
+    counters, _ = _process_folder(
         folder, files, cutoff_year, confidence_threshold, xmp_only, enable_geo,
         folder_consensus=folder_consensus, dry_run=dry_run, skip_dated=skip_dated,
         geo_confidence_threshold=geo_confidence_threshold,
         run_log=run_log,
+        work_offset=0,
+        work_total=_nr_work_total,
     )
     _print_run_complete_panel(counters)
     run_log['finished'] = datetime.now().isoformat(timespec='seconds')
@@ -3022,14 +3147,21 @@ def _video_parse_year(text):
 
 
 def _video_consensus_year(year_conf_pairs, threshold):
-    """Compute the plurality consensus year from frame-level estimates."""
+    """Compute the plurality consensus year from frame-level estimates.
+
+    A strict majority (``best_votes * 2 > total``) is required — a 50/50 tie
+    is intentionally **not** a majority.  This mirrors the integer-arithmetic
+    test used in :func:`_apply_consensus_year` and avoids floating-point
+    comparison inconsistencies.
+    """
     eligible = [(yr, c) for yr, c in year_conf_pairs if yr and c >= threshold]
     if not eligible:
         return None, 0, 0, False
-    counts              = Counter(yr for yr, _ in eligible)
-    best, best_votes    = counts.most_common(1)[0]
-    majority            = best_votes > len(eligible) / 2
-    return best, best_votes, len(eligible), majority
+    counts           = Counter(yr for yr, _ in eligible)
+    best, best_votes = counts.most_common(1)[0]
+    total            = len(eligible)
+    majority         = best_votes * 2 > total   # strict majority; mirrors _apply_consensus_year
+    return best, best_votes, total, majority
 
 
 def _video_analyze_frame(ts, image_path, index, total, video_name=""):
@@ -3384,14 +3516,8 @@ if __name__ == "__main__":
         ))
         console.print()
 
-    import platform as _platform
-    _is_windows = _platform.system() == "Windows"
-
-    def _strip_shell_escapes(p: str) -> str:
-        """Remove bash/zsh backslash-escapes from a pasted path."""
-        if _is_windows:
-            return p
-        return re.sub(r'\\(.)', r'\1', p)
+    # _strip_shell_escapes is defined at module level (Platform helpers section).
+    # The _is_windows local is no longer needed here.
 
     if args.directory:
         input_path = _strip_shell_escapes(args.directory.strip())
@@ -3432,6 +3558,8 @@ if __name__ == "__main__":
                 folder_consensus     = args.consensus or False,
                 dry_run              = args.dry_run,
                 skip_dated           = args.skip_dated,
+                work_offset          = 0,
+                work_total           = 1,
             )
         else:
             console.print(f"[red]Unsupported file type: {ext}[/red]")
@@ -3490,7 +3618,7 @@ if __name__ == "__main__":
     if args.cutoff is not None:
         cutoff_year = args.cutoff
     else:
-        raw = _ask("Skip photos dated from which year or later?", "2010")
+        raw = _ask("Skip photos dated from which year or later?", str(_CONFIG["defaults"]["cutoff_year"]))
         try:
             cutoff_year = int(raw)
         except ValueError:
@@ -3500,7 +3628,7 @@ if __name__ == "__main__":
     if args.date_confidence is not None:
         confidence_threshold = args.date_confidence
     else:
-        raw = _ask("Date confidence threshold (1-10)", "7")
+        raw = _ask("Date confidence threshold (1-10)", str(_CONFIG["defaults"]["date_confidence"]))
         try:
             confidence_threshold = int(raw)
         except ValueError:
@@ -3520,7 +3648,7 @@ if __name__ == "__main__":
         if args.geo_confidence is not None:
             geo_confidence_threshold = args.geo_confidence
         else:
-            raw = _ask("Location confidence threshold (1-10, higher = stricter)", "7")
+            raw = _ask("Location confidence threshold (1-10, higher = stricter)", str(_CONFIG["defaults"]["geo_confidence"]))
             try:
                 geo_confidence_threshold = max(1, min(10, int(raw)))
             except ValueError:
