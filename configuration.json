@@ -1,0 +1,23 @@
+{
+    "_comment": "Metadata-AI configuration. All fields are optional — defaults are shown.",
+
+    "lm_studio": {
+        "url":   "http://localhost:1234/v1",
+        "model": "qwen/qwen3.6-27b"
+    },
+
+    "defaults": {
+        "directory":        "./photos",
+        "cutoff_year":      2010,
+        "date_confidence":  7,
+        "geo_confidence":   7
+    },
+
+    "limits": {
+        "vlm_max_dimension":  2048,
+        "max_image_pixels":   500000000,
+        "min_photo_year":     1826,
+        "min_video_year":     1888,
+        "max_year":           2100
+    }
+}
