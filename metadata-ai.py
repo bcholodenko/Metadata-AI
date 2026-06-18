@@ -150,6 +150,23 @@ _TIME_WORDS = {
     "night", "dawn", "dusk", "sunrise", "sunset", "golden hour",
 }
 
+# Era/age words that are meaningless noise for a collection that is entirely
+# composed of old photos.  The VLM correctly observes that a photo looks
+# vintage — but tagging every image "vintage" or "retro" adds zero search
+# value and pollutes the keyword cloud.  Strip them in post-processing AND
+# instruct the VLM not to generate them in the first place.
+_KEYWORD_NOISE = {
+    "vintage", "retro", "old", "old photo", "old photograph",
+    "antique", "aged", "classic", "nostalgic", "nostalgia",
+    "historical", "historic", "history", "old-fashioned", "old fashioned",
+    "film", "film photo", "analog", "analogue", "grainy", "grain",
+    "faded", "sepia", "black and white", "black & white", "monochrome",
+    "photo", "photograph", "photography", "image", "picture",
+    "scan", "scanned", "digitized", "digitised",
+    "person", "people", "human", "man", "woman", "individual",
+    "unknown", "unidentified",
+}
+
 # Location hedge phrases — indicate the VLM is guessing rather than identifying.
 _LOCATION_HEDGE_PHRASES = (
     "no identifiable", "no clear", "cannot identify", "unable to",
@@ -196,7 +213,7 @@ Rules:
 - TITLE: if the video has a clear formal title use it; for personal footage
   use a descriptive title like "1970s Family Footage" or "Summer 1965 Vacation"; otherwise none
 - DESCRIPTION: one sentence describing the video
-- KEYWORDS: 5-8 lowercase keywords, comma-separated
+- KEYWORDS: 5-8 lowercase keywords, comma-separated — focus on subjects, activities, and settings; do NOT use era/style words like vintage, retro, old, antique, nostalgic, historic, film, analog, or photograph
 - LOCATION: specific city or place if clearly identifiable and you have at least 8/10 confidence (visible sign, recognisable landmark, or distinctive architecture); otherwise none — do not guess from general landscape appearance
 - GENRE: pick exactly one from this list:
     Home Movie - personal or family footage without a formal production
@@ -255,6 +272,76 @@ def _resolve_binary(name: str) -> str:
 # Interactive prompt helpers
 # ---------------------------------------------------------------------------
 
+# Cache for the one-time CPR terminal probe (None = not yet tested).
+_CPR_SUPPORTED: Optional[bool] = None
+
+
+def _check_cpr() -> bool:
+    """Return True if the terminal supports Cursor Position Reports (CPR).
+
+    questionary / prompt_toolkit send an ESC[6n escape sequence and wait for
+    the terminal to echo back its cursor position.  Terminals that do not
+    implement CPR (tmux, screen, some SSH sessions, VS Code's integrated
+    terminal in certain modes, etc.) never respond, causing prompt_toolkit to
+    print::
+
+        WARNING: your terminal doesn't support cursor position requests (CPR).
+
+    We probe once at first call, cache the result, and return False for
+    incapable terminals so the callers fall through to the plain-text
+    fallback instead of triggering the warning.
+
+    On Windows the CPR warning never appears (prompt_toolkit uses the Win32
+    Console API there), so we return True immediately to preserve the
+    arrow-key UI on Windows.
+    """
+    global _CPR_SUPPORTED
+    if _CPR_SUPPORTED is not None:
+        return _CPR_SUPPORTED
+
+    # Must be a real interactive terminal on both stdin and stdout.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        _CPR_SUPPORTED = False
+        return False
+
+    import platform
+    if platform.system() == "Windows":
+        # Windows uses Win32 Console API — no CPR dance needed.
+        _CPR_SUPPORTED = True
+        return True
+
+    try:
+        import termios
+        import tty
+        import select as _sel
+
+        fd  = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            # Request cursor position.
+            sys.stdout.write("\033[6n")
+            sys.stdout.flush()
+            # Give the terminal up to 150 ms to reply.
+            ready, _, _ = _sel.select([sys.stdin], [], [], 0.15)
+            if not ready:
+                _CPR_SUPPORTED = False
+                return False
+            # Read the response: ESC [ <row> ; <col> R
+            buf = ""
+            while len(buf) < 32:
+                ch = os.read(fd, 1).decode("ascii", errors="ignore")
+                buf += ch
+                if ch == "R":
+                    break
+            _CPR_SUPPORTED = bool(re.search(r'\x1b\[\d+;\d+R', buf))
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        _CPR_SUPPORTED = False
+
+    return _CPR_SUPPORTED
+
 
 def _yn(prompt: str, default_yes: bool = False) -> bool:
     """Display a styled yes/no prompt and return the boolean answer."""
@@ -286,7 +373,7 @@ def _questionary_select(
     """Display an arrow-key selection menu, falling back to a numbered list."""
     try:
         import questionary
-        if sys.stdin.isatty():
+        if _check_cpr():
             q_choices = [
                 questionary.Choice(title=f"{k:<22} {desc}", value=k)
                 for k, desc in choices
@@ -315,7 +402,7 @@ def _yn_select(prompt: str, default_yes: bool = False) -> bool:
     """Display a Yes/No arrow-key questionary select."""
     try:
         import questionary
-        if sys.stdin.isatty():
+        if _check_cpr():
             yes_choice = questionary.Choice("Yes", value=True)
             no_choice  = questionary.Choice("No",  value=False)
             result = questionary.select(
@@ -400,25 +487,55 @@ def _keypress_listener():
         pass
 
 
+_PAUSE_LISTENER_THREAD = None   # module-level handle so stop can join it
+
+
 def start_pause_listener():
-    """Start the background keypress listener thread."""
+    """Start the background keypress listener thread.
+
+    Safe to call multiple times (e.g. after a resume): clears the stop-event
+    before spawning so the new thread doesn't exit immediately.
+    """
+    global _PAUSE_LISTENER_THREAD
     if not sys.stdin.isatty():
         return
     _STOP_LISTENER.clear()
-    t = threading.Thread(target=_keypress_listener, daemon=True, name="pause-listener")
-    t.start()
+    _PAUSE_LISTENER_THREAD = threading.Thread(
+        target=_keypress_listener, daemon=True, name="pause-listener"
+    )
+    _PAUSE_LISTENER_THREAD.start()
 
 
 def stop_pause_listener():
-    """Signal the keypress listener thread to exit."""
+    """Signal the keypress listener thread to exit and wait for it to finish.
+
+    Joining with a short timeout ensures the thread has released stdin before
+    the main thread calls console.input() — eliminating the race where both
+    readers compete for the same file descriptor.
+    """
+    global _PAUSE_LISTENER_THREAD
     _STOP_LISTENER.set()
+    if _PAUSE_LISTENER_THREAD is not None and _PAUSE_LISTENER_THREAD.is_alive():
+        _PAUSE_LISTENER_THREAD.join(timeout=0.5)   # 0.5 s > select() poll interval (0.1 s)
+    _PAUSE_LISTENER_THREAD = None
 
 
 def check_for_pause():
-    """If the user pressed p, print a pause message and wait for Enter."""
+    """If the user pressed p, print a pause message and wait for Enter.
+
+    The background listener thread is stopped before we block on stdin and
+    restarted afterward.  This prevents the race condition where the listener
+    consumes the resume-Enter keystroke and immediately re-sets _PAUSE_EVENT,
+    causing the app to pause again on the very next photo.
+    """
     if not _PAUSE_EVENT.is_set():
         return
     _PAUSE_EVENT.clear()
+
+    # Hand stdin back to the main thread exclusively so the listener cannot
+    # race with console.input() over the same file descriptor.
+    stop_pause_listener()
+
     console.print(
         "\n[bold yellow]⏸  Paused[/bold yellow] [dim]— press Enter to continue, "
         "or Ctrl-C to quit (progress is saved).[/dim]"
@@ -429,6 +546,12 @@ def check_for_pause():
         raise   # let Ctrl-C propagate normally
     except EOFError:
         pass
+
+    # Discard any event queued while we were waiting (e.g. user typed p again),
+    # then hand stdin back to the listener thread.
+    _PAUSE_EVENT.clear()
+    start_pause_listener()
+
     console.print("[bold green]▶  Resuming…[/bold green]\n")
 
 
@@ -1222,7 +1345,7 @@ def run_review_pass(folder, xmp_only=False):
         choice = None
         try:
             import questionary
-            if sys.stdin.isatty():
+            if _check_cpr():
                 choice = questionary.select(
                     "Decision:",
                     choices=[
@@ -1776,7 +1899,7 @@ def _vlm_describe_photo(image_path, folder_hint_loc, enable_geo):
         "SETTING: <'indoor' or 'outdoor'>\n"
         "FLASH: <'yes' or 'no' — whether flash appears to have fired>\n"
         f"{geo_instruction}"
-        "KEYWORDS: <5 descriptive keywords, comma separated>"
+        "KEYWORDS: <5 descriptive keywords, comma separated — focus on SUBJECTS, ACTIVITIES, and SETTINGS; do NOT use era/style words like vintage, retro, old, antique, nostalgic, historic, film, analog, grainy, faded, sepia, or photograph>"
     )
 
     console.print(f"      [dim]Describing…[/dim]")
@@ -1812,6 +1935,7 @@ def _vlm_describe_photo(image_path, folder_hint_loc, enable_geo):
         filtered = [
             k.strip().lower() for k in raw_keywords.split(',')
             if k.strip().lower() not in _TIME_WORDS
+            and k.strip().lower() not in _KEYWORD_NOISE
         ]
         tags_out = ', '.join(filtered) if filtered else None
 
@@ -2119,7 +2243,7 @@ def _process_folder(
         SpinnerColumn(),
         TextColumn("[bold cyan]{task.description}"),
         BarColumn(),
-        MofNCompleteColumn(),
+        TextColumn("[progress.percentage]Photo {task.completed}/{task.total}"),
         TextColumn("{task.fields[eta]}"),
         console=console,
         transient=False,
@@ -3257,7 +3381,11 @@ def _video_extract_metadata(summary, consensus_yr):
     return {
         "title":       _video_parse_field(text, "TITLE"),
         "description": _video_parse_field(text, "DESCRIPTION"),
-        "keywords":    _video_parse_field(text, "KEYWORDS"),
+        "keywords":    ", ".join(
+            k for k in _video_parse_field(text, "KEYWORDS").split(",")
+            if k.strip().lower() not in _KEYWORD_NOISE
+            and k.strip().lower() not in _TIME_WORDS
+        ),
         "location":    _video_parse_field(text, "LOCATION"),
         "genre":       _video_parse_field(text, "GENRE"),
         "artist":      _video_parse_field(text, "ARTIST"),
@@ -3379,7 +3507,7 @@ def process_video(video_path, interval=30, output_path=None):
             SpinnerColumn(),
             TextColumn("[bold cyan]{task.description}"),
             BarColumn(),
-            MofNCompleteColumn(),
+            TextColumn("[progress.percentage]Frame {task.completed}/{task.total}"),
             TimeRemainingColumn(),
             console=console,
         ) as progress:
