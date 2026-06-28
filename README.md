@@ -253,7 +253,7 @@ Each photo offers four choices: **accept** the AI's guess, **enter** a different
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+GPLv3 — see [LICENSE](LICENSE) for details.
 
 ---
 
